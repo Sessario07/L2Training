@@ -39,3 +39,14 @@ chaos/.active
 chaos/history.log
 chaos/.manual-active
 chaos/.manual-pod.yaml
+
+# Helm subchart archives.
+#
+# COMMITTED on purpose (the ! un-ignores them). ArgoCD resolves dependencies by
+# running `helm dependency build`, which needs network access to
+# https://aws.github.io/eks-charts at sync time. Vendoring the .tgz makes the
+# sync hermetic and pins exactly what was tested - the same reason you commit
+# a lockfile. Chart.lock records the resolved version.
+!chart/charts/
+!chart/charts/*.tgz
+!chart/Chart.lock

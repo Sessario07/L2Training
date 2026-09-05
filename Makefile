@@ -95,6 +95,40 @@ push-frontend: login ## Rebuild and push ONLY the frontend (fast iteration)
 	kubectl apply -k k8s/app
 	kubectl -n l2lab rollout status deploy/frontend --timeout=3m
 
+## --------------------------------------------------------------- helm
+
+# The chart is the GitOps-ready path: everything that changes per-build is a
+# value, so ArgoCD can render the same chart from git. `make deploy` (below)
+# still drives the older k8s/ Kustomize tree and is kept as a fallback.
+
+chart-deps: ## Fetch the chart's subchart dependencies
+	helm dependency update ./chart
+
+chart-lint: chart-deps ## Lint and render the chart without a cluster
+	helm lint ./chart \
+	  --set global.vpcId=vpc-0000000000000000 \
+	  --set app.image.tag=lint --set frontend.image.tag=lint
+	@helm template l2lab ./chart -n kube-system \
+	  --set global.vpcId=vpc-0000000000000000 \
+	  --set app.image.tag=lint --set frontend.image.tag=lint \
+	  --set hardening.enabled=true > /dev/null && echo "  template renders clean"
+
+chart-install: chart-deps push ## Install/upgrade the chart directly (no ArgoCD)
+	@test -n "$(VPC_ID)" || { echo "no vpc_id - run 'make infra' first"; exit 1; }
+	helm upgrade --install l2lab ./chart \
+	  -n kube-system --create-namespace \
+	  --set global.vpcId=$(VPC_ID) \
+	  --set aws-load-balancer-controller.vpcId=$(VPC_ID) \
+	  --set app.image.tag=$(TAG) \
+	  --set frontend.image.tag=$(TAG)
+	@$(MAKE) --no-print-directory urls
+
+chart-values: ## Print the --set flags ArgoCD or helm needs right now
+	@echo "global.vpcId=$(VPC_ID)"
+	@echo "aws-load-balancer-controller.vpcId=$(VPC_ID)"
+	@echo "app.image.tag=$(TAG)"
+	@echo "frontend.image.tag=$(TAG)"
+
 ## --------------------------------------------------------- kubernetes
 
 deploy: ## Apply all Kubernetes manifests, in dependency order
@@ -372,6 +406,10 @@ check: ## Validate everything without touching AWS
 	  fi; \
 	  echo "  ok - terraform, Makefile and k8s manifests all agree on '$$tfname'"
 
+	@echo "=== helm chart ==="
+	@helm lint ./chart --set global.vpcId=vpc-0 --set app.image.tag=l --set frontend.image.tag=l 2>&1 | tail -1 | sed 's/^/  /'
+	@helm template l2lab ./chart -n kube-system --set global.vpcId=vpc-0 --set app.image.tag=l --set frontend.image.tag=l --set hardening.enabled=true >/dev/null && echo "  template renders clean"
+
 	@echo "=== ansible syntax ==="
 	@cd ansible && for p in site.yml verify.yml ops/*.yml; do \
 	  printf "  %-24s" "$$p"; ansible-playbook --syntax-check $$p >/dev/null 2>&1 \
@@ -382,4 +420,4 @@ check: ## Validate everything without touching AWS
 .PHONY: help bootstrap vendor init plan infra kubeconfig login build push \
         deploy up redeploy urls status logs events grafana prometheus psql \
         redis-cli seed load sleep wake cost down orphans check restart-grafana push-frontend \
-        harden unharden verify diagnose password chaos break hint reveal fix inventory history guard
+        harden unharden verify diagnose password chaos break hint reveal fix inventory history guard chart-deps chart-lint chart-install chart-values

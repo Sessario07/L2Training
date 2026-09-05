@@ -1,0 +1,103 @@
+{{- if .Values.ingress.enabled }}
+{{- $ns := include "l2lab.appNs" . }}
+{{- $appHost := include "l2lab.appHost" . }}
+{{/*
+TWO Ingresses on the SAME hostname, sharing ONE ALB, split by path.
+
+group.order IS the routing priority and it matters enormously. The ALB
+evaluates listener rules in ascending order and stops at the first match. The
+frontend rule is /* which matches EVERYTHING including /api - so if its order
+were lower than the API's, every API call would be answered with index.html
+and the site would break in a way that looks like a frontend bug.
+
+    10  /api/*   -> app        (specific, must be first)
+    20  /*       -> frontend   (catch-all, last)
+    30  grafana  -> different hostname
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    # internet-facing puts the ALB in the PUBLIC subnets, which are found by
+    # the kubernetes.io/role/elb=1 tag. A missing tag is the most common
+    # reason an ALB never appears - and there is no error anywhere except the
+    # controller's own logs.
+    alb.ingress.kubernetes.io/scheme: {{ .Values.ingress.scheme }}
+    # target-type: ip registers POD IPs directly, skipping the kube-proxy hop.
+    alb.ingress.kubernetes.io/target-type: {{ .Values.ingress.targetType }}
+    alb.ingress.kubernetes.io/group.name: {{ .Values.ingress.groupName }}
+    alb.ingress.kubernetes.io/group.order: {{ .Values.ingress.order.api | quote }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # No certificate-arn: the controller discovers the matching ACM cert by
+    # comparing the host rules below against certificates in the account.
+    #
+    # The ALB's own health check, SEPARATE from the kubelet's readiness probe.
+    # A target can be Ready to Kubernetes and unhealthy to the ALB (or the
+    # reverse) - knowing which is failing is half of diagnosing a 502.
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: {{ .Values.ingress.healthcheck.intervalSeconds | quote }}
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: {{ .Values.ingress.healthcheck.timeoutSeconds | quote }}
+    alb.ingress.kubernetes.io/healthy-threshold-count: {{ .Values.ingress.healthcheck.healthyThreshold | quote }}
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: {{ .Values.ingress.healthcheck.unhealthyThreshold | quote }}
+    alb.ingress.kubernetes.io/success-codes: "200"
+    # Must be shorter than the pod's terminationGracePeriodSeconds.
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+    # ExternalDNS reads this and creates the Route53 alias. Only ONE of the two
+    # Ingresses on this hostname should have it - both would fight over the
+    # same record.
+    external-dns.alpha.kubernetes.io/hostname: {{ $appHost }}
+    alb.ingress.kubernetes.io/tags: Name={{ .Values.global.namePrefix }}-alb,Project={{ .Values.global.namePrefix }},ManagedBy=helm
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ $appHost }}
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: app
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    alb.ingress.kubernetes.io/scheme: {{ .Values.ingress.scheme }}
+    alb.ingress.kubernetes.io/target-type: {{ .Values.ingress.targetType }}
+    alb.ingress.kubernetes.io/group.name: {{ .Values.ingress.groupName }}
+    # Higher than the API's, so /api is matched first.
+    alb.ingress.kubernetes.io/group.order: {{ .Values.ingress.order.frontend | quote }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=15
+    alb.ingress.kubernetes.io/tags: Name={{ .Values.global.namePrefix }}-alb,Project={{ .Values.global.namePrefix }},ManagedBy=helm
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ $appHost }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+{{- end }}

@@ -1,0 +1,99 @@
+{{- if and .Values.postgres.enabled .Values.postgres.exporter.enabled }}
+{{/*
+Creates the read-only monitoring role and the pg_stat_statements extension.
+
+A Job, because docker-entrypoint-initdb.d only runs when the data directory is
+EMPTY - on any rebuild against an existing volume it never runs again - and the
+app's static .sql migrations cannot interpolate a generated password.
+
+As a Helm HOOK it runs after the database is up and before the app needs it.
+hook-delete-policy keeps a completed Job from blocking the next upgrade, since
+Job specs are immutable and re-applying one fails.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-monitoring-role
+  namespace: {{ include "l2lab.appNs" . }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "5"
+    helm.sh/hook-delete-policy: before-hook-creation
+  labels:
+    app: postgres-monitoring-role
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: postgres-monitoring-role
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: postgres
+      securityContext:
+        {{- include "l2lab.podSecurityContext" (list 70 70 "") | nindent 8 }}
+      containers:
+        - name: setup
+          image: {{ .Values.postgres.image }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              export PGPASSWORD="$(cat /mnt/secrets/postgres-password)"
+              MONITOR_PW="$(cat /mnt/secrets/postgres-monitor-password)"
+              HOST={{ include "l2lab.svcFqdn" (list . "postgres" (include "l2lab.appNs" .)) }}
+
+              echo "waiting for postgres..."
+              until pg_isready -h "$HOST" -U l2lab -d l2lab >/dev/null 2>&1; do sleep 2; done
+
+              echo "creating pg_stat_statements extension"
+              psql -h "$HOST" -U l2lab -d l2lab -v ON_ERROR_STOP=1 \
+                -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+
+              echo "creating/updating the l2lab_monitor role"
+              psql -h "$HOST" -U l2lab -d l2lab -v ON_ERROR_STOP=1 <<SQL
+              DO \$\$
+              BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'l2lab_monitor') THEN
+                  CREATE ROLE l2lab_monitor LOGIN;
+                END IF;
+              END
+              \$\$;
+              ALTER ROLE l2lab_monitor WITH PASSWORD '${MONITOR_PW}';
+              -- pg_monitor is a predefined role bundling read access to the
+              -- statistics views. It grants NO access to table data.
+              GRANT pg_monitor TO l2lab_monitor;
+              GRANT CONNECT ON DATABASE l2lab TO l2lab_monitor;
+              GRANT USAGE ON SCHEMA public TO l2lab_monitor;
+              SQL
+
+              echo "verifying least privilege"
+              PGPASSWORD="${MONITOR_PW}" psql -h "$HOST" -U l2lab_monitor -d l2lab -tAc \
+                "SELECT 'stats ok: '||count(*) FROM pg_stat_database;"
+              if PGPASSWORD="${MONITOR_PW}" psql -h "$HOST" -U l2lab_monitor -d l2lab \
+                   -tAc "SELECT count(*) FROM users;" >/dev/null 2>&1; then
+                echo "WARNING: monitor role can read table data - privileges too broad"
+              else
+                echo "confirmed: monitor role cannot SELECT from users"
+              fi
+          volumeMounts:
+            - { name: secrets, mountPath: /mnt/secrets, readOnly: true }
+          resources:
+            requests: { cpu: 25m, memory: 48Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            readOnlyRootFilesystem: true
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: postgres
+{{- end }}

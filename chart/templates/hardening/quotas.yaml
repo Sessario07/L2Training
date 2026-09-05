@@ -1,0 +1,95 @@
+{{- if and .Values.hardening.enabled .Values.hardening.resourceQuota.enabled }}
+# ---------------------------------------------------------------------------
+# ResourceQuota and LimitRange
+#
+# A quota is a blast-radius control. Without one, a single runaway Deployment
+# (a bad HPA, a fat-fingered replica count) can consume the whole cluster and
+# starve everything else — including the monitoring you need to diagnose it.
+#
+# A LimitRange supplies defaults, so a pod submitted with NO resource requests
+# still gets some. That matters because a pod with no requests is scheduled as
+# BestEffort and is first in line to be evicted under memory pressure — and
+# people forget requests constantly.
+# ---------------------------------------------------------------------------
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: l2lab
+  namespace: {{ include "l2lab.appNs" . }}
+spec:
+  hard:
+    # Sized against a 2 x t4g.large cluster (~13.5Gi allocatable), leaving
+    # room for the observability namespace and kube-system.
+    requests.cpu: {{ .Values.hardening.resourceQuota.app.requestsCpu | quote }}
+    requests.memory: {{ .Values.hardening.resourceQuota.app.requestsMemory }}
+    limits.memory: {{ .Values.hardening.resourceQuota.app.limitsMemory }}
+
+    pods: {{ .Values.hardening.resourceQuota.app.pods | quote }}
+    persistentvolumeclaims: "6"
+    services: "10"
+    # Cap LoadBalancer Services: each one is a real, billable AWS load
+    # balancer. This is a cost control as much as a capacity one.
+    services.loadbalancers: "0"
+    count/deployments.apps: "10"
+    count/cronjobs.batch: "5"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: l2lab
+  namespace: {{ include "l2lab.appNs" . }}
+spec:
+  limits:
+    - type: Container
+      # Applied when a container specifies nothing.
+      default:
+        memory: 256Mi
+      defaultRequest:
+        cpu: 25m
+        memory: 64Mi
+      # Rejects anything asking for more than this, so one manifest cannot
+      # swallow the entire quota by itself.
+      max:
+        cpu: "1"
+        memory: 1Gi
+      min:
+        cpu: 10m
+        memory: 16Mi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 20Gi
+      min:
+        storage: 1Gi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: observability
+  namespace: {{ include "l2lab.obsNs" . }}
+spec:
+  hard:
+    requests.cpu: {{ .Values.hardening.resourceQuota.app.requestsCpu | quote }}
+    requests.memory: {{ .Values.hardening.resourceQuota.app.requestsMemory }}
+    limits.memory: {{ .Values.hardening.resourceQuota.app.limitsMemory }}
+    pods: {{ .Values.hardening.resourceQuota.app.pods | quote }}
+    persistentvolumeclaims: "8"
+    services.loadbalancers: "0"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: observability
+  namespace: {{ include "l2lab.obsNs" . }}
+spec:
+  limits:
+    - type: Container
+      default:
+        memory: 512Mi
+      defaultRequest:
+        cpu: 25m
+        memory: 128Mi
+      max:
+        cpu: "2"
+        memory: 2Gi
+{{- end }}

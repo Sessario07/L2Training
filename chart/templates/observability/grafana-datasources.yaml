@@ -1,0 +1,100 @@
+{{- if .Values.observability.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: {{ include "l2lab.obsNs" . }}
+data:
+  datasources.yaml: |
+    # This file is the single most important piece of the observability setup.
+    # Anyone can run three databases; what makes them USEFUL is the links
+    # between them. The settings below are what let you go:
+    #
+    #   metric spike -> exemplar -> trace -> span -> the exact log lines
+    #
+    # ...in about four clicks, instead of manually copying timestamps around.
+    apiVersion: 1
+
+    datasources:
+      # --- Metrics ------------------------------------------------------
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.observability.svc.cluster.local:9090
+        isDefault: true
+        jsonData:
+          timeInterval: 15s
+          httpMethod: POST
+          # A histogram bucket can carry an exemplar: the trace ID of one
+          # request that landed in it. Clicking that dot on a latency graph
+          # opens the trace. This mapping tells Grafana where to open it.
+          exemplarTraceIdDestinations:
+            - name: trace_id
+              datasourceUid: tempo
+              urlDisplayLabel: "View trace"
+
+      # --- Logs ---------------------------------------------------------
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://loki.observability.svc.cluster.local:3100
+        jsonData:
+          maxLines: 1000
+          # Derived fields turn a value inside a log line into a clickable
+          # link. Our app writes trace_id into structured metadata, so every
+          # log line gets a "View trace" button.
+          derivedFields:
+            - name: TraceID
+              # Read from structured metadata rather than regexing the body -
+              # faster, and it works even when the message format changes.
+              datasourceUid: tempo
+              matcherType: label
+              matcherRegex: trace_id
+              url: "$${__value.raw}"
+              urlDisplayLabel: "View trace"
+
+      # --- Traces -------------------------------------------------------
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        access: proxy
+        url: http://tempo.observability.svc.cluster.local:3200
+        jsonData:
+          # From a span, jump to the logs emitted during that span. Grafana
+          # builds the LogQL query from the tags below plus the time range.
+          tracesToLogsV2:
+            datasourceUid: loki
+            spanStartTimeShift: "-2m"
+            spanEndTimeShift: "2m"
+            tags:
+              - key: service.name
+                value: service
+            filterByTraceID: true
+            filterBySpanID: false
+
+          # From a span, jump to the RED metrics for that service.
+          tracesToMetrics:
+            datasourceUid: prometheus
+            spanStartTimeShift: "-2m"
+            spanEndTimeShift: "2m"
+            queries:
+              - name: "Request rate"
+                query: 'sum(rate(app_http_requests_total{$$__tags}[5m]))'
+              - name: "p99 latency"
+                query: 'histogram_quantile(0.99, sum(rate(app_http_request_duration_seconds_bucket{$$__tags}[5m])) by (le))'
+
+          # Draws the automatic service topology map, using the metrics
+          # Tempo's metrics-generator writes into Prometheus.
+          serviceMap:
+            datasourceUid: prometheus
+
+          # The node graph view of a trace: shows the call tree as a diagram.
+          nodeGraph:
+            enabled: true
+
+          # Uses span metrics to show a latency histogram alongside a trace.
+          tracesToProfiles:
+            datasourceUid: prometheus
+{{- end }}

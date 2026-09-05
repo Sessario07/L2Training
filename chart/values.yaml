@@ -1,0 +1,366 @@
+# ---------------------------------------------------------------------------
+# l2lab
+#
+# Every value that used to be hardcoded into a manifest lives here. That is the
+# whole point of the Helm conversion: the two things that change on every
+# rebuild - the VPC id and the image tags - were previously baked into YAML and
+# stamped in by `make deploy`, which meant ArgoCD could never be the source of
+# truth. Now they are values.
+#
+# REQUIRED before install (no sensible default exists):
+#   global.vpcId    - `terraform -chdir=terraform output -raw vpc_id`
+#
+# Everything else has a working default for this account.
+# ---------------------------------------------------------------------------
+
+global:
+  # --- identity -----------------------------------------------------------
+  # Must match `var.name` in terraform/variables.tf. Used to build IAM role
+  # ARNs, Secrets Manager paths and the ALB target-group names.
+  namePrefix: l2lab-sawibowo
+
+  accountId: "134604498185"
+  region: ap-southeast-3
+
+  # The EKS cluster name. The load balancer controller uses it to find subnets
+  # by the kubernetes.io/cluster/<name> tag.
+  clusterName: l2lab-sawibowo
+
+  # REQUIRED. Changes on every `terraform apply` that recreates the VPC.
+  # Leaving it empty fails the install with a clear message rather than
+  # letting the controller start and silently find zero subnets.
+  vpcId: ""
+
+  # --- dns ----------------------------------------------------------------
+  # Produces app.<domain> and grafana.<domain>.
+  domain: sawibowo.sandbox.devopsinstitute.id
+  # The SHARED Route53 zone. ExternalDNS is pinned to it and only manages
+  # records it owns (TXT registry), so it cannot touch other learners' records.
+  hostedZoneId: Z0646008ZGZY2INOOAOG
+
+  # --- namespaces ---------------------------------------------------------
+  namespaces:
+    app: l2lab
+    observability: observability
+
+  storageClass: gp3
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+app:
+  enabled: true
+  image:
+    repository: 134604498185.dkr.ecr.ap-southeast-3.amazonaws.com/l2lab-sawibowo/api
+    # Overridden per deploy. NEVER use a mutable tag like `latest` - during an
+    # incident you must be able to say exactly which code is running, and the
+    # ECR repository is configured IMMUTABLE so a repushed tag would fail.
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  # replicas is deliberately ABSENT. The HPA owns replica count at runtime;
+  # setting it here makes the manifest and the autoscaler fight each other on
+  # every sync - the Deployment goes back to N, the HPA scales it up again.
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 2
+    targetCPUUtilizationPercentage: 70
+
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    # Memory only. A CPU limit here throttles bcrypt during login bursts and
+    # presents as unexplained latency; memory is incompressible so it must be
+    # bounded.
+    limits: { memory: 192Mi }
+
+  # Must exceed the app's own PRESTOP_DELAY plus its drain budget, or
+  # Kubernetes SIGKILLs mid-drain and clients see connection resets.
+  terminationGracePeriodSeconds: 40
+
+  podDisruptionBudget:
+    enabled: true
+    # maxUnavailable, NOT minAvailable. With a floor of 1 replica,
+    # `minAvailable: 1` makes the only pod un-evictable and deadlocks
+    # `kubectl drain` forever.
+    maxUnavailable: 1
+
+  config:
+    logLevel: info
+    appEnv: lab
+
+frontend:
+  enabled: true
+  image:
+    repository: 134604498185.dkr.ecr.ap-southeast-3.amazonaws.com/l2lab-sawibowo/frontend
+    tag: ""
+    pullPolicy: IfNotPresent
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 2
+    targetCPUUtilizationPercentage: 70
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 96Mi }
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+
+worker:
+  enabled: true
+  replicas: 1
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { memory: 128Mi }
+  # Artificial per-message delay, used for chaos exercises. Empty = disabled.
+  workDelay: ""
+
+# ---------------------------------------------------------------------------
+# Ingress / ALB
+#
+# Three Ingresses share ONE ALB via group.name, split by path priority:
+#   10  /api/*  -> app        (specific, must be evaluated FIRST)
+#   20  /*      -> frontend   (catch-all, matches everything including /api)
+#   30  grafana.<domain>      (different hostname)
+# Invert 10 and 20 and every API call is answered with index.html.
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: alb
+  groupName: l2lab
+  scheme: internet-facing
+  targetType: ip
+  # No certificateArn: the controller discovers the matching ACM cert by
+  # comparing the host rules against certificates in the account.
+  healthcheck:
+    intervalSeconds: 15
+    timeoutSeconds: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+  order:
+    api: 10
+    frontend: 20
+    grafana: 30
+
+# ---------------------------------------------------------------------------
+# Data layer - self-hosted, no managed AWS services
+# ---------------------------------------------------------------------------
+postgres:
+  enabled: true
+  image: postgres:17-alpine
+  storage: 8Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  # Passed straight to the postgres binary. pg_stat_statements must be
+  # preloaded at startup - it cannot be enabled at runtime, which is why
+  # turning it on costs a restart.
+  extraArgs:
+    - -c
+    - shared_preload_libraries=pg_stat_statements
+    - -c
+    - pg_stat_statements.max=5000
+    - -c
+    - pg_stat_statements.track=all
+    - -c
+    - track_io_timing=on
+    - -c
+    - log_min_duration_statement=500
+    - -c
+    - log_lock_waits=on
+    - -c
+    - log_checkpoints=on
+  exporter:
+    enabled: true
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.19.0
+    resources:
+      requests: { cpu: 25m, memory: 48Mi }
+      limits: { memory: 128Mi }
+
+redis:
+  enabled: true
+  image: redis:7.4-alpine
+  storage: 2Gi
+  # A ceiling BELOW the container limit, so Redis evicts keys itself instead of
+  # being OOMKilled by the kernel. Note sessions are evictable too under
+  # allkeys-lru - a full Redis logs everybody out.
+  maxmemory: 192mb
+  maxmemoryPolicy: allkeys-lru
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }
+  exporter:
+    enabled: true
+    image: oliver006/redis_exporter:v1.83.0
+    # Count keys per PATTERN, so sessions and cached timelines are separate
+    # series. This is what makes "everyone got logged out" a graph rather than
+    # a guess. The flag is -check-keys, NOT -check-key-patterns.
+    checkKeys: "session:*,timeline:*"
+    resources:
+      requests: { cpu: 10m, memory: 24Mi }
+      limits: { memory: 64Mi }
+
+nats:
+  enabled: true
+  image: nats:2.11-alpine
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { memory: 128Mi }
+  exporter:
+    enabled: true
+    # A separate Deployment, not a sidecar: this image runs as root by default,
+    # which the `restricted` Pod Security Standard forbids. A metrics exporter
+    # must never be able to break the thing it observes.
+    image: natsio/prometheus-nats-exporter:0.17.3
+    resources:
+      requests: { cpu: 10m, memory: 24Mi }
+      limits: { memory: 64Mi }
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+observability:
+  enabled: true
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    storage: 8Gi
+    # Short on purpose. Long retention only buys disk cost in a lab; real
+    # production keeps ~15d locally and ships older data to remote storage.
+    retention: 6h
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { memory: 1Gi }
+
+  alertmanager:
+    enabled: true
+    image: prom/alertmanager:v0.29.0
+    storage: 1Gi
+    resources:
+      requests: { cpu: 10m, memory: 64Mi }
+      limits: { memory: 128Mi }
+
+  loki:
+    image: grafana/loki:3.6.0
+    storage: 8Gi
+    retention: 24h
+    resources:
+      requests: { cpu: 50m, memory: 256Mi }
+      limits: { memory: 512Mi }
+
+  tempo:
+    image: grafana/tempo:2.9.1
+    storage: 8Gi
+    retention: 24h
+    resources:
+      requests: { cpu: 50m, memory: 256Mi }
+      limits: { memory: 512Mi }
+
+  grafana:
+    image: grafana/grafana:12.4.1
+    storage: 2Gi
+    # Reachable from the public internet through the ALB. An open Grafana
+    # leaks the entire internal topology of the cluster.
+    anonymousAccess: false
+    resources:
+      requests: { cpu: 50m, memory: 192Mi }
+      limits: { memory: 384Mi }
+
+  alloy:
+    image: grafana/alloy:v1.12.1
+    resources:
+      requests: { cpu: 25m, memory: 128Mi }
+      limits: { memory: 256Mi }
+
+# ---------------------------------------------------------------------------
+# ExternalDNS
+# ---------------------------------------------------------------------------
+externalDns:
+  enabled: true
+  image: registry.k8s.io/external-dns/external-dns:v0.20.0
+  # MUST name the hosted ZONE, not your subdomain. ExternalDNS matches this
+  # against zone names; a narrower filter matches zero zones and it silently
+  # creates nothing while logging "no changes for the matching hosted zones".
+  domainFilter: sandbox.devopsinstitute.id
+  # THE safety rail in a zone shared with ~30 learners: ExternalDNS records
+  # ownership in a companion TXT record and will only modify or delete records
+  # whose TXT names this owner.
+  txtOwnerId: l2lab-sawibowo
+  txtPrefix: "_extdns."
+  policy: sync
+  resources:
+    requests: { cpu: 10m, memory: 64Mi }
+    limits: { memory: 128Mi }
+
+# ---------------------------------------------------------------------------
+# AWS Load Balancer Controller (subchart)
+# Values under this key are passed to the AWS chart, not ours.
+# ---------------------------------------------------------------------------
+awsLoadBalancerController:
+  enabled: true
+
+aws-load-balancer-controller:
+  clusterName: l2lab-sawibowo
+  # BOTH must be explicit. Without vpcId the controller tries to discover the
+  # VPC from EC2 instance metadata and crash-loops with
+  # "failed to get VPC ID ... context deadline exceeded".
+  #
+  # NOTE: a subchart cannot read the parent's values, so clusterName/region/
+  # vpcId must be set HERE too. The Makefile and the ArgoCD Application both
+  # pass --set for global.vpcId AND aws-load-balancer-controller.vpcId.
+  region: ap-southeast-3
+  vpcId: ""
+  serviceAccount:
+    create: true
+    name: aws-load-balancer-controller
+    annotations:
+      # IRSA. Without this the controller starts fine, then fails every AWS
+      # call with AccessDenied - and the Ingress simply never produces an ALB,
+      # with the real reason buried in the controller's logs.
+      eks.amazonaws.com/role-arn: arn:aws:iam::134604498185:role/l2lab-sawibowo-aws-lbc
+  enableCertManager: false   # the chart generates its own webhook certs
+  # Do not create an IngressClass named alb twice if one already exists.
+  createIngressClassResource: true
+  ingressClass: alb
+
+# ---------------------------------------------------------------------------
+# Hardening - applied separately on purpose
+#
+# A subtly wrong NetworkPolicy produces symptoms indistinguishable from DNS
+# failure or a dead dependency. Stand the stack up green first, THEN enable
+# this, so you know which change caused what.
+# ---------------------------------------------------------------------------
+hardening:
+  enabled: false
+
+  networkPolicy:
+    enabled: true
+    # Only ENFORCED if the VPC CNI addon has enableNetworkPolicy=true.
+    # Without that the API server accepts every policy and enforces none -
+    # worse than having none, because you believe you are segmented.
+    vpcCidr: 10.42.0.0/16
+
+  resourceQuota:
+    enabled: true
+    # Must be >= current usage + (maxReplicas - minReplicas) x request for
+    # every HPA in the namespace, or autoscaling is rejected at admission and
+    # no Pending pod ever appears to tell you why.
+    app:
+      requestsCpu: "2"
+      requestsMemory: 3Gi
+      limitsMemory: 5Gi
+      pods: "30"
+    observability:
+      requestsCpu: "2"
+      requestsMemory: 3Gi
+      limitsMemory: 5Gi
+      pods: "30"
+
+  limitRange:
+    enabled: true
+
+  backup:
+    enabled: true
+    schedule: "0 2 * * *"
+    awsCliImage: amazon/aws-cli:2.31.29

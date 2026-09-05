@@ -1,0 +1,63 @@
+{{/*
+Namespaces and the StorageClass.
+
+sync-wave "-2": these must exist before anything that lives in them. The
+annotation is inert without ArgoCD - plain `helm install` orders by kind - but
+ArgoCD applies everything in one pass unless told otherwise, and would race.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "l2lab.appNs" . }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  labels:
+    name: {{ include "l2lab.appNs" . }}
+    {{- include "l2lab.labels" . | nindent 4 }}
+    # `restricted` Pod Security Standard: no privileged containers, no host
+    # namespaces, must run as non-root. Every workload here is written to
+    # satisfy it, which is why each one pins an explicit runAsUser.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "l2lab.obsNs" . }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  labels:
+    name: {{ include "l2lab.obsNs" . }}
+    {{- include "l2lab.labels" . | nindent 4 }}
+    # Only `baseline` here: Alloy needs latitude that `restricted` forbids.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.global.storageClass }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+    storageclass.kubernetes.io/is-default-class: "true"
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+  # Tag the volumes the driver creates. Without these a PVC's EBS volume
+  # carries only kubernetes.io/cluster/... and is invisible to cost
+  # attribution by Owner - which matters in an account shared with ~30 people.
+  # NOTE the backticks: {{`{{ .PVCName }}`}} is the EBS CSI DRIVER's own
+  # templating, not Helm's. Backticks make it a raw string so Helm passes it
+  # through untouched instead of trying to resolve .PVCName itself.
+  tagSpecification_1: "Name={{ .Values.global.namePrefix }}-{{`{{ .PVCNamespace }}`}}-{{`{{ .PVCName }}`}}"
+  tagSpecification_2: "Project={{ .Values.global.namePrefix }}"
+  tagSpecification_3: "ManagedBy=helm"
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+# EBS volumes are AZ-locked, so the volume must not be created until the
+# scheduler has picked an AZ. With Immediate binding you get pods stuck
+# Pending forever because the disk is in AZ-b and the only free node is in c.
+volumeBindingMode: WaitForFirstConsumer

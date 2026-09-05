@@ -1,0 +1,78 @@
+{{- if .Values.worker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: {{ include "l2lab.appNs" . }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app: worker
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: worker
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        {{- include "l2lab.podSecurityContext" (list 65534 65534 "") | nindent 8 }}
+      containers:
+        - name: worker
+          # Same image as the API, different binary. One build, two workloads -
+          # which also guarantees they cannot drift out of sync.
+          image: {{ include "l2lab.image" (list . .Values.app.image) }}
+          imagePullPolicy: {{ .Values.app.image.pullPolicy }}
+          command: ["/worker"]
+          ports:
+            - name: http
+              containerPort: 8081
+          envFrom:
+            - configMapRef: { name: app-config }
+          env:
+            - name: DATABASE_URL_FILE
+              value: /mnt/secrets/postgres-url
+            - name: LISTEN_ADDR
+              value: ":8081"
+            {{- if .Values.worker.workDelay }}
+            # Artificial per-message delay. Set this and watch
+            # app_worker_lag_seconds climb linearly while the site stays up -
+            # the difference between degraded and broken.
+            - name: WORK_DELAY
+              value: {{ .Values.worker.workDelay | quote }}
+            {{- end }}
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          volumeMounts:
+            - { name: secrets, mountPath: /mnt/secrets, readOnly: true }
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+            periodSeconds: 20
+            failureThreshold: 3
+          # No readiness probe: the worker takes no inbound traffic, so there
+          # is no target group to add or remove it from.
+          securityContext:
+            readOnlyRootFilesystem: true
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: postgres
+{{- end }}

@@ -1,0 +1,133 @@
+{{- if .Values.redis.enabled }}
+{{- $ns := include "l2lab.appNs" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+data:
+  redis.conf: |
+    bind 0.0.0.0
+    protected-mode no
+    appendonly yes
+    appendfsync everysec
+    # A hard ceiling BELOW the container limit, so Redis evicts keys itself
+    # rather than being OOMKilled by the kernel. Note that under
+    # allkeys-lru SESSIONS are evictable too - a full Redis logs everyone out.
+    maxmemory {{ .Values.redis.maxmemory }}
+    maxmemory-policy {{ .Values.redis.maxmemoryPolicy }}
+    # RDB snapshotting off: the AOF covers durability and forking to snapshot
+    # doubles memory.
+    save ""
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  labels:
+    app: redis
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  labels:
+    app: redis
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+      annotations:
+        {{- if .Values.redis.exporter.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+        prometheus.io/path: /metrics
+        {{- end }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        {{- include "l2lab.podSecurityContext" (list 999 1000 1000) | nindent 8 }}
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          command: ["redis-server", "/etc/redis/redis.conf"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - { name: config, mountPath: /etc/redis }
+            - { name: data, mountPath: /data }
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 10
+          livenessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+        {{- if .Values.redis.exporter.enabled }}
+        - name: exporter
+          image: {{ .Values.redis.exporter.image }}
+          args:
+            - --redis.addr=redis://127.0.0.1:6379
+            - --web.listen-address=:9121
+            # The flag is -check-keys, NOT -check-key-patterns. This exporter
+            # uses Go's stdlib flag package, which REJECTS unknown flags by
+            # printing usage and exiting - so a typo crash-loops the sidecar.
+            - --check-keys={{ .Values.redis.exporter.checkKeys }}
+            - --count-keys={{ .Values.redis.exporter.checkKeys }}
+            - --include-system-metrics
+          ports:
+            - name: metrics
+              containerPort: 9121
+          resources:
+            {{- toYaml .Values.redis.exporter.resources | nindent 12 }}
+          # No readinessProbe - same reason as the Postgres exporter: a broken
+          # metrics sidecar must not make Redis itself unreachable.
+          securityContext:
+            runAsUser: 59000
+            runAsGroup: 59000
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+        {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.global.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.storage }}
+{{- end }}

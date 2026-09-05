@@ -1,0 +1,50 @@
+{{/*
+Fail the render immediately if a required value is missing, with a message
+that says what to do about it.
+
+Without this, an empty vpcId installs "successfully" and then the load
+balancer controller finds zero subnets. The error it logs points at subnet
+TAGGING, which sends you hunting through terraform/vpc.tf for a problem that
+does not exist:
+
+    couldn't auto-discover subnets: unable to resolve at least one subnet.
+    Evaluated 0 subnets: 0 are tagged for other clusters, ...
+
+("Evaluated 0" is the tell - wrong tags would evaluate the subnets and reject
+them; evaluating none means it is looking in the wrong VPC.) That cost an hour
+the first time. Fail loudly at render instead.
+*/}}
+
+{{- if .Values.awsLoadBalancerController.enabled }}
+{{- $vpc := .Values.global.vpcId }}
+{{- if or (not $vpc) (eq $vpc "") }}
+{{- fail "\n\nglobal.vpcId is required.\n\n  Get it with:\n    terraform -chdir=terraform output -raw vpc_id\n\n  Then either commit it to values.yaml, or pass it:\n    --set global.vpcId=vpc-xxxxxxxx\n\n  It changes every time terraform recreates the VPC.\n" }}
+{{- end }}
+{{- if not (hasPrefix "vpc-" $vpc) }}
+{{- fail (printf "global.vpcId must look like vpc-xxxxxxxx, got %q" $vpc) }}
+{{- end }}
+{{- end }}
+
+{{- if and .Values.app.enabled (not .Values.app.image.tag) }}
+{{- fail "\n\napp.image.tag is required - never deploy a mutable tag.\n\n  During an incident you must be able to say exactly which code is running,\n  and the ECR repository is IMMUTABLE so a repushed tag would fail anyway.\n\n  Pass it:  --set app.image.tag=$(git rev-parse --short HEAD)\n" }}
+{{- end }}
+
+{{- if and .Values.frontend.enabled (not .Values.frontend.image.tag) }}
+{{- fail "frontend.image.tag is required - see app.image.tag." }}
+{{- end }}
+
+{{/*
+The AWS Load Balancer Controller subchart has no namespace value of its own -
+like every subchart, it deploys into the RELEASE namespace. Our own templates
+pin their namespaces explicitly (l2lab, observability, kube-system), so the
+release namespace affects only the controller.
+
+Installing into `default` scatters the controller's ServiceAccount, Deployment,
+webhook Service and TLS Secret across the default namespace, where nothing else
+lives and nobody thinks to look. Insist on kube-system.
+*/}}
+{{- if .Values.awsLoadBalancerController.enabled }}
+{{- if eq .Release.Namespace "default" }}
+{{- fail "\n\nInstall this release into kube-system, not default.\n\n  helm:   helm upgrade --install l2lab ./chart -n kube-system --create-namespace\n  argocd: spec.destination.namespace: kube-system\n\n  Only the aws-load-balancer-controller subchart follows the release\n  namespace - every other object pins its own (l2lab, observability).\n" }}
+{{- end }}
+{{- end }}

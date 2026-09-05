@@ -1,0 +1,189 @@
+{{- if .Values.app.enabled }}
+{{- $ns := include "l2lab.appNs" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app: app
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  # A Service selects pods by LABEL QUERY. Kubernetes does not validate that
+  # anything matches - a selector pointing at nothing applies cleanly, even
+  # under `--dry-run=server`, and the only evidence is an empty EndpointSlice.
+  selector:
+    app: app
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app: app
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.app.autoscaling.enabled }}
+  replicas: 1
+  {{- end }}
+  {{/*
+  When the HPA is enabled, `replicas` is deliberately OMITTED. The HPA owns
+  that field at runtime; setting it here makes the manifest and the autoscaler
+  fight - every sync resets it to N and the HPA immediately scales it back.
+  */}}
+  selector:
+    matchLabels:
+      app: app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      # Never drop below the desired count during a deploy. This is why a bad
+      # image leaves the rollout stuck instead of taking the site down.
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: app
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+        # Roll the pods when config changes, which a ConfigMap edit alone does
+        # not do - env vars are read once at container start.
+        checksum/config: {{ include (print $.Template.BasePath "/app/configmap.yaml") . | sha256sum | trunc 16 }}
+    spec:
+      serviceAccountName: app
+      # Must exceed the app's own PRESTOP_DELAY plus its drain budget, or
+      # Kubernetes SIGKILLs mid-drain and clients see resets.
+      terminationGracePeriodSeconds: {{ .Values.app.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- include "l2lab.podSecurityContext" (list 65534 65534 "") | nindent 8 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: app }
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: app }
+      containers:
+        - name: api
+          image: {{ include "l2lab.image" (list . .Values.app.image) }}
+          imagePullPolicy: {{ .Values.app.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef: { name: app-config }
+          env:
+            # Read from the CSI-mounted file, not secretKeyRef. secretKeyRef is
+            # resolved BEFORE the container starts, but a CSI-synced Secret only
+            # exists once a pod mounting it is running - so the first deploy
+            # fails with CreateContainerConfigError. Files also stay out of
+            # crash dumps and `kubectl describe`.
+            - name: DATABASE_URL_FILE
+              value: /mnt/secrets/postgres-url
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          volumeMounts:
+            - { name: secrets, mountPath: /mnt/secrets, readOnly: true }
+          resources:
+            {{- toYaml .Values.app.resources | nindent 12 }}
+          # LIVENESS: shallow on purpose. If this checked Postgres, a database
+          # blip would restart every pod and turn a recoverable dependency
+          # outage into a cluster-wide crash loop.
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # READINESS: deep. Failing pulls the pod from the ALB target group
+          # WITHOUT restarting it, so it can recover on its own.
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # STARTUP: covers the migration run on first boot, suspending
+          # liveness until it succeeds.
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 3
+            failureThreshold: 30
+          securityContext:
+            readOnlyRootFilesystem: true
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: postgres
+{{- if .Values.app.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: app
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  # maxUnavailable, NOT minAvailable. With a floor of 1 replica,
+  # minAvailable: 1 makes the only pod un-evictable and deadlocks
+  # `kubectl drain` forever.
+  maxUnavailable: {{ .Values.app.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels: { app: app }
+{{- end }}
+{{- if .Values.app.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: app
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: app
+  minReplicas: {{ .Values.app.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.app.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # A percentage of the REQUEST, not the limit.
+          averageUtilization: {{ .Values.app.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+{{- end }}
+{{- end }}

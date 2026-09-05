@@ -1,0 +1,139 @@
+{{- if .Values.frontend.enabled }}
+{{- $ns := include "l2lab.appNs" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app: frontend
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    app: frontend
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.frontend.autoscaling.enabled }}
+  replicas: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      app: frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # 101 is `nginx` in nginx-unprivileged. The standard nginx image starts
+        # as root and drops privileges in its entrypoint, which `restricted`
+        # forbids - hence the unprivileged variant.
+        {{- include "l2lab.podSecurityContext" (list 101 101 "") | nindent 8 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: frontend }
+      containers:
+        - name: nginx
+          image: {{ include "l2lab.image" (list . .Values.frontend.image) }}
+          imagePullPolicy: {{ .Values.frontend.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            {{- toYaml .Values.frontend.resources | nindent 12 }}
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 15
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 15
+          volumeMounts:
+            # nginx writes pid files and request buffers; its config points all
+            # of it at /tmp so the root filesystem can stay read-only.
+            - { name: tmp, mountPath: /tmp }
+          securityContext:
+            readOnlyRootFilesystem: true
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+{{- if .Values.frontend.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.frontend.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels: { app: frontend }
+{{- end }}
+{{- if .Values.frontend.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+  minReplicas: {{ .Values.frontend.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.frontend.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.frontend.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+{{- end }}
+{{- end }}

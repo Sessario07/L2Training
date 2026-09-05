@@ -1,0 +1,154 @@
+{{- if .Values.nats.enabled }}
+{{- $ns := include "l2lab.appNs" . }}
+{{/*
+NATS - the asynchronous seam between the API and the worker.
+
+A Deployment, not a StatefulSet, because this uses CORE NATS (fire-and-forget
+pub/sub), not JetStream. No disk, no persistence: a restart loses in-flight
+messages, which leaves timelines stale until their TTL expires. Degraded, not
+broken - and that distinction is the whole reason an async component is here.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+data:
+  nats.conf: |
+    port: 4222
+    http: 8222
+    max_payload: 1MB
+    max_connections: 1000
+    # Slow consumers are disconnected rather than allowed to balloon server
+    # memory. A worker that cannot keep up shows as a reconnect loop, not a
+    # NATS OOMKill.
+    write_deadline: "5s"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  labels:
+    app: nats
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: nats
+  ports:
+    - { name: client, port: 4222, targetPort: 4222 }
+    - { name: monitor, port: 8222, targetPort: 8222 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  labels:
+    app: nats
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      securityContext:
+        {{- include "l2lab.podSecurityContext" (list 1000 1000 "") | nindent 8 }}
+      containers:
+        - name: nats
+          image: {{ .Values.nats.image }}
+          args: ["-c", "/etc/nats/nats.conf"]
+          ports:
+            - { name: client, containerPort: 4222 }
+            - { name: monitor, containerPort: 8222 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/nats }
+          resources:
+            {{- toYaml .Values.nats.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8222 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8222 }
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: nats-config
+{{- if .Values.nats.exporter.enabled }}
+---
+{{/*
+A separate Deployment rather than a sidecar, unlike the Postgres and Redis
+exporters: this image declares no USER so it would run as root, which the
+`restricted` PSS forbids. Overriding runAsUser on a sidecar that then fails
+would take NATS down with it. Isolate what you are less sure about.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-exporter
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  labels:
+    app: nats-exporter
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats-exporter
+  template:
+    metadata:
+      labels:
+        app: nats-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7777"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        {{- include "l2lab.podSecurityContext" (list 65534 65534 "") | nindent 8 }}
+      containers:
+        - name: exporter
+          image: {{ .Values.nats.exporter.image }}
+          args:
+            - -varz
+            - -connz
+            # -subz, NOT -subsz. Same stdlib-flag trap as redis_exporter.
+            - -subz
+            - -routez
+            - -healthz
+            - -port=7777
+            - http://{{ include "l2lab.svcFqdn" (list . "nats" $ns) }}:8222
+          ports:
+            - name: metrics
+              containerPort: 7777
+          resources:
+            {{- toYaml .Values.nats.exporter.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /metrics, port: 7777 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 6
+          securityContext:
+            readOnlyRootFilesystem: true
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+{{- end }}
+{{- end }}

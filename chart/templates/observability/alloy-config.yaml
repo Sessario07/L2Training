@@ -1,0 +1,119 @@
+{{- if .Values.observability.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: {{ include "l2lab.obsNs" . }}
+data:
+  config.alloy: |
+    // Grafana Alloy: the log collection agent.
+    // (Alloy replaced Promtail, which reached end of life in 2025.)
+    //
+    // Pipeline: discover pods -> relabel -> tail logs -> parse JSON ->
+    //           attach trace_id -> push to Loki.
+
+    logging {
+      level  = "info"
+      format = "logfmt"
+    }
+
+    // --- 1. Find every pod on THIS node -----------------------------------
+    discovery.kubernetes "pods" {
+      role = "pod"
+
+      selectors {
+        role  = "pod"
+        field = "spec.nodeName=" + coalesce(sys.env("NODE_NAME"), "")
+      }
+    }
+
+    // --- 2. Turn Kubernetes metadata into Loki labels ---------------------
+    // Keep the label set SMALL. Every distinct combination of label values
+    // creates a new stream in Loki, and high cardinality is what kills it.
+    // Never label with pod IP, request ID, or user ID.
+    discovery.relabel "pods" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_node_name"]
+        target_label  = "node"
+      }
+
+      // Only collect from our own namespaces. Without this you also ingest
+      // every kube-system log, which is mostly noise and burns disk.
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        regex         = "l2lab|observability"
+        action        = "keep"
+      }
+    }
+
+    // --- 3. Tail the container logs via the Kubernetes API ----------------
+    loki.source.kubernetes "pods" {
+      targets    = discovery.relabel.pods.output
+      forward_to = [loki.process.parse.receiver]
+    }
+
+    // --- 4. Parse the JSON our app emits ----------------------------------
+    loki.process "parse" {
+      // Pull fields out of the JSON log line.
+      stage.json {
+        expressions = {
+          level    = "level",
+          trace_id = "trace_id",
+          service  = "service",
+          message  = "message",
+        }
+      }
+
+      // `level` becomes a real label: low cardinality (5 values), and being
+      // able to filter to errors instantly is worth a lot.
+      stage.labels {
+        values = { level = "level" }
+      }
+
+      // trace_id goes into STRUCTURED METADATA, not a label. It is unique per
+      // request, so as a label it would create millions of streams and destroy
+      // Loki. Structured metadata is indexed differently and is exactly what
+      // Grafana's derived-field trace link reads.
+      stage.structured_metadata {
+        values = { trace_id = "trace_id" }
+      }
+
+      // Use the app's own timestamp rather than ingestion time, so log order
+      // survives a collector restart or backlog.
+      stage.timestamp {
+        source = "timestamp"
+        format = "RFC3339Nano"
+        action_on_failure = "fudge"
+      }
+
+      forward_to = [loki.write.default.receiver]
+    }
+
+    // --- 5. Ship to Loki ---------------------------------------------------
+    loki.write "default" {
+      endpoint {
+        url = "http://loki.observability.svc.cluster.local:3100/loki/api/v1/push"
+      }
+      external_labels = {
+        cluster = "l2lab-sawibowo",
+      }
+    }
+{{- end }}

@@ -1,0 +1,184 @@
+{{- if .Values.postgres.enabled }}
+{{- $ns := include "l2lab.appNs" . }}
+{{/*
+PostgreSQL.
+
+A StatefulSet, not a Deployment, because this pod owns a disk: it gets a stable
+name (postgres-0) and a stable PVC that survives a reschedule. A Deployment
+would happily start a second pod against the same volume and corrupt it.
+
+The Service is HEADLESS (clusterIP: None) so DNS resolves straight to the pod.
+That has a sharp edge worth knowing: headless DNS publishes only READY
+endpoints, so anything that makes this pod unready makes the database
+unresolvable cluster-wide - see the exporter sidecar below.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  labels:
+    app: postgres
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  labels:
+    app: postgres
+    {{- include "l2lab.labels" . | nindent 4 }}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+      annotations:
+        {{- if .Values.postgres.exporter.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+        prometheus.io/path: /metrics
+        {{- end }}
+    spec:
+      serviceAccountName: postgres
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        {{/* The postgres image's default USER is root and its entrypoint drops
+             privileges itself, which `restricted` forbids. 70 is the postgres
+             user in the Alpine image. fsGroup makes the kubelet chown the EBS
+             volume so a non-root process can write to it. */}}
+        {{- include "l2lab.podSecurityContext" (list 70 70 70) | nindent 8 }}
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            {{- toYaml .Values.postgres.extraArgs | nindent 12 }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: l2lab
+            - name: POSTGRES_USER
+              value: l2lab
+            # The official image supports the _FILE convention natively, so
+            # the password never exists as an environment variable.
+            - name: POSTGRES_PASSWORD_FILE
+              value: /mnt/secrets/postgres-password
+            # PGDATA must be a SUBDIRECTORY of the mount: an EBS volume
+            # arrives with lost+found and initdb refuses a non-empty directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          # Startup probe covers initdb on first boot. Without it an aggressive
+          # liveness probe kills the pod mid-initdb and you get an infinite
+          # crash loop.
+          startupProbe:
+            exec: { command: ["pg_isready", "-U", "l2lab", "-d", "l2lab"] }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "l2lab", "-d", "l2lab"] }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec: { command: ["pg_isready", "-U", "l2lab", "-d", "l2lab"] }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+        {{- if .Values.postgres.exporter.enabled }}
+        - name: exporter
+          image: {{ .Values.postgres.exporter.image }}
+          # The exporter takes its DSN from DATA_SOURCE_NAME and the CSI driver
+          # gives it to us as a file, so a one-line wrapper reads the file into
+          # the env var. The credential never appears in the pod spec.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export DATA_SOURCE_NAME="$(cat /mnt/secrets/postgres-monitor-url)"
+              exec /bin/postgres_exporter \
+                --collector.stat_statements \
+                --collector.stat_statements.include_query \
+                --collector.stat_statements.limit=100 \
+                --collector.long_running_transactions \
+                --collector.locks \
+                --collector.stat_activity_autovacuum \
+                --collector.statio_user_tables \
+                --collector.stat_user_tables \
+                --collector.process_idle \
+                --web.listen-address=:9187
+          ports:
+            - name: metrics
+              containerPort: 9187
+          volumeMounts:
+            - name: secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+          resources:
+            {{- toYaml .Values.postgres.exporter.resources | nindent 12 }}
+          {{/*
+          NO readinessProbe, deliberately.
+
+          A container's readiness rolls up into the POD's readiness, and this
+          Service is headless, so DNS publishes only ready pods. Giving this
+          sidecar a readiness probe once deadlocked the whole stack:
+
+            exporter not ready (monitoring role did not exist yet)
+              -> pod not ready
+              -> postgres.<ns>.svc.cluster.local returns NXDOMAIN
+              -> the Job that creates the role cannot connect
+              -> the role is never created
+
+          ...and it took the application down too, because the app could no
+          longer resolve the database. A metrics sidecar must NEVER gate the
+          readiness of the thing it observes.
+          */}}
+          securityContext:
+            runAsUser: 65534
+            {{- include "l2lab.containerSecurityContext" . | nindent 12 }}
+        {{- end }}
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: postgres
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.global.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+{{- end }}

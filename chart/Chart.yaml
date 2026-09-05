@@ -1,0 +1,30 @@
+apiVersion: v2
+name: l2lab
+description: |
+  A production-shaped social app on EKS with full observability, packaged for
+  GitOps. Everything that changes between environments or rebuilds is a value,
+  so the same chart deploys to any cluster.
+type: application
+
+# version    = the CHART's version. Bump when templates change.
+# appVersion = the default application image tag. Overridden per-deploy.
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords: [eks, observability, gitops]
+home: https://github.com/Sessario07/L2Training
+
+dependencies:
+  # The AWS Load Balancer Controller, from AWS's own chart.
+  #
+  # Previously this repo vendored 1,473 lines of upstream YAML into
+  # k8s/platform/aws-lbc/upstream.yaml - which was ALSO gitignored, so ArgoCD
+  # could never have deployed it. A chart dependency fixes both problems: no
+  # vendored copy to drift, and clusterName/vpcId become ordinary values.
+  #
+  # It also generates its own admission-webhook certificates, so the
+  # cert-manager EKS addon is no longer required for it.
+  - name: aws-load-balancer-controller
+    version: "3.5.0"
+    repository: https://aws.github.io/eks-charts
+    condition: awsLoadBalancerController.enabled

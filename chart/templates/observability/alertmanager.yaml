@@ -1,0 +1,159 @@
+{{- if .Values.observability.enabled }}
+# ---------------------------------------------------------------------------
+# Alertmanager
+#
+# Prometheus decides WHEN an alert fires. Alertmanager decides what happens
+# next: grouping, deduplication, inhibition, silencing and routing.
+#
+# There is no external receiver wired up here — no Slack webhook, no PagerDuty
+# key, because a lab has nowhere real to page. What you still get, and what is
+# actually worth learning, is the full alert lifecycle and the Alertmanager UI:
+# watch an alert go pending -> firing -> grouped, then silence it and watch it
+# stop. Adding a real receiver later is about six lines (see the comment on
+# `receivers` below).
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: {{ include "l2lab.obsNs" . }}
+data:
+  alertmanager.yml: |
+    global:
+      # If a firing alert stops being sent by Prometheus, mark it resolved
+      # after this long. Must be longer than Prometheus's evaluation interval
+      # or alerts flap resolved/firing.
+      resolve_timeout: 5m
+
+    route:
+      # Group alerts so a node failure that trips six rules produces ONE
+      # notification, not six. This is the whole point of Alertmanager.
+      group_by: ['alertname', 'namespace']
+
+      # Wait this long for other alerts in the same group before sending, so a
+      # cascading failure arrives as one message.
+      group_wait: 30s
+      # Then this long before sending an update about a group already notified.
+      group_interval: 5m
+      # And this long before re-sending a still-firing alert.
+      repeat_interval: 4h
+
+      receiver: default
+
+      routes:
+        # Critical alerts get a shorter fuse and repeat more often.
+        - matchers:
+            - severity = "critical"
+          receiver: default
+          group_wait: 10s
+          repeat_interval: 1h
+
+    receivers:
+      # A receiver with no integrations. Alerts still appear in the UI and in
+      # the ALERTS metric; nothing is sent anywhere.
+      #
+      # To route to Slack instead, replace this with:
+      #   - name: default
+      #     slack_configs:
+      #       - api_url: <webhook>
+      #         channel: '#alerts'
+      #         title: '{{`{{ .CommonLabels.alertname }}`}}'
+      #         text: '{{`{{ range .Alerts }}`}}{{`{{ .Annotations.summary }}`}}{{`{{ end }}`}}'
+      - name: default
+
+    inhibit_rules:
+      # If a node is down, do not also page about every pod on it. Inhibition
+      # is what stops one root cause producing twenty notifications.
+      - source_matchers:
+          - alertname = "NodeNotReady"
+        target_matchers:
+          - severity =~ "warning|critical"
+        equal: ['node']
+
+      # A critical alert suppresses the warning-level version of itself.
+      - source_matchers:
+          - severity = "critical"
+        target_matchers:
+          - severity = "warning"
+        equal: ['alertname', 'namespace']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: {{ include "l2lab.obsNs" . }}
+  labels: { app: alertmanager }
+spec:
+  selector: { app: alertmanager }
+  ports:
+    - name: http
+      port: 9093
+      targetPort: 9093
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: alertmanager
+  namespace: {{ include "l2lab.obsNs" . }}
+spec:
+  serviceName: alertmanager
+  replicas: 1
+  selector:
+    matchLabels: { app: alertmanager }
+  template:
+    metadata:
+      labels: { app: alertmanager }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9093"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+        fsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: alertmanager
+          image: {{ .Values.observability.alertmanager.image }}
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+            # Must match how Prometheus reaches it, or silence links in
+            # notifications point somewhere that does not resolve.
+            - --web.external-url=http://alertmanager.observability.svc.cluster.local:9093
+          ports:
+            - { name: http, containerPort: 9093 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/alertmanager }
+            # Silences live on disk. Without a volume, every restart clears
+            # them and alerts you deliberately muted come roaring back.
+            - { name: data, mountPath: /alertmanager }
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+            limits: { memory: 128Mi }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: 9093 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: 9093 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: alertmanager-config }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.global.storageClass }}
+        resources:
+          requests: { storage: {{ .Values.observability.alertmanager.storage }} }
+{{- end }}

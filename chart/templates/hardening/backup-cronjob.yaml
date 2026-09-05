@@ -1,0 +1,149 @@
+{{- if and .Values.hardening.enabled .Values.hardening.backup.enabled }}
+# ---------------------------------------------------------------------------
+# Nightly PostgreSQL backup to S3
+#
+# Two containers, in sequence:
+#   1. initContainer  pg_dump  -> a shared emptyDir
+#   2. container      aws s3 cp -> the backup bucket
+#
+# initContainers run to completion BEFORE the main container starts, which is
+# what gives us ordering. Two ordinary containers in one pod would run
+# concurrently and race.
+#
+# Restoring is covered in ansible/ops/restore-db.yml. A backup you have never
+# restored is not a backup.
+# ---------------------------------------------------------------------------
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backup
+  namespace: {{ include "l2lab.appNs" . }}
+  annotations:
+    eks.amazonaws.com/role-arn: {{ include "l2lab.roleArn" (list . "backup") }}
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: backup
+  namespace: {{ include "l2lab.appNs" . }}
+spec:
+  provider: aws
+  parameters:
+    objects: |
+      - objectName: "{{ include "l2lab.secretId" (list . "postgres") }}"
+        objectType: "secretsmanager"
+        jmesPath:
+          - path: "password"
+            objectAlias: "postgres-password"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: {{ include "l2lab.appNs" . }}
+spec:
+  # 02:00 UTC = 09:00 Jakarta. Off-peak for the workload, and during working
+  # hours locally so a failure is noticed the same day.
+  schedule: {{ .Values.hardening.backup.schedule | quote }}
+  timeZone: "Etc/UTC"
+
+  # Do not pile up runs if one hangs. Forbid means a late job is skipped
+  # rather than overlapping with the one still going.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+  jobTemplate:
+    spec:
+      # Give up after 3 attempts rather than retrying a broken job forever.
+      backoffLimit: 3
+      # Hard ceiling, so a hung pg_dump cannot hold a slot indefinitely.
+      activeDeadlineSeconds: 1800
+
+      template:
+        metadata:
+          labels: { app: backup }
+        spec:
+          serviceAccountName: backup
+          restartPolicy: OnFailure
+          securityContext:
+            runAsUser: 70
+            runAsGroup: 70
+            runAsNonRoot: true
+            fsGroup: 70
+            seccompProfile: { type: RuntimeDefault }
+
+          initContainers:
+            - name: dump
+              image: {{ .Values.postgres.image }}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+                  echo "dumping l2lab at ${STAMP}"
+                  # -Fc is the custom format: compressed, and restorable
+                  # selectively with pg_restore. Plain SQL is neither.
+                  PGPASSWORD="$(cat /mnt/secrets/postgres-password)" \
+                  pg_dump -h postgres.l2lab.svc.cluster.local -U l2lab -d l2lab \
+                          -Fc --no-owner --no-privileges \
+                          -f "/scratch/l2lab-${STAMP}.dump"
+                  ls -lh /scratch/
+                  echo "${STAMP}" > /scratch/stamp
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+                - { name: secrets, mountPath: /mnt/secrets, readOnly: true }
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { memory: 256Mi }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+
+          containers:
+            - name: upload
+              image: {{ .Values.hardening.backup.awsCliImage }}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  STAMP="$(cat /scratch/stamp)"
+                  FILE="/scratch/l2lab-${STAMP}.dump"
+                  echo "uploading ${FILE} ($(stat -c%s "$FILE") bytes)"
+                  aws s3 cp "$FILE" \
+                    "s3://${BACKUP_BUCKET}/postgres/l2lab-${STAMP}.dump" \
+                    --only-show-errors
+                  echo "verifying the object actually landed"
+                  aws s3api head-object --bucket "${BACKUP_BUCKET}" \
+                    --key "postgres/l2lab-${STAMP}.dump" \
+                    --query 'ContentLength' --output text
+                  echo "backup complete: ${STAMP}"
+              env:
+                - name: BACKUP_BUCKET
+                  value: {{ .Values.global.namePrefix }}-backups-{{ .Values.global.accountId }}
+                - name: AWS_REGION
+                  value: {{ .Values.global.region }}
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { memory: 256Mi }
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: { drop: ["ALL"] }
+
+          volumes:
+            - name: scratch
+              emptyDir:
+                sizeLimit: 2Gi
+            - name: secrets
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: backup
+{{- end }}

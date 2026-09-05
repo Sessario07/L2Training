@@ -1,0 +1,138 @@
+{{- if .Values.externalDns.enabled }}
+# ExternalDNS watches Ingress objects and keeps Route53 in sync with them.
+# Without it, you would copy ALB hostnames into the Route53 console by hand
+# every time the load balancer is recreated.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-dns
+  namespace: kube-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    # THE IRSA LINK. This annotation is what makes the pod's projected
+    # ServiceAccount token exchangeable for AWS credentials.
+    #
+    # The ARN is deterministic - Terraform builds it as
+    # "<var.name>-external-dns" - so it can be written literally here rather
+    # than templated in. If you change `name` in terraform/variables.tf, you
+    # MUST change it here too, or every DNS update fails with AccessDenied.
+    #
+    # The matching trust policy is in terraform/irsa.tf and pins
+    #     system:serviceaccount:kube-system:external-dns
+    # so this ServiceAccount's namespace and name must not change either.
+    eks.amazonaws.com/role-arn: {{ include "l2lab.roleArn" (list . "external-dns") }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-dns
+rules:
+  - apiGroups: [""]
+    resources: [services, endpoints, pods, nodes]
+    verbs: [get, watch, list]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: [ingresses]
+    verbs: [get, watch, list]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, watch, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-dns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-dns
+subjects:
+  - kind: ServiceAccount
+    name: external-dns
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns
+  namespace: kube-system
+  labels: { app: external-dns }
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two ExternalDNS instances running at once
+  # would race each other writing the same Route53 records.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: external-dns }
+  template:
+    metadata:
+      labels: { app: external-dns }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7979"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: external-dns
+      securityContext:
+        runAsUser: 65534
+        runAsNonRoot: true
+        fsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: external-dns
+          image: {{ .Values.externalDns.image }}
+          args:
+            - --source=ingress
+            - --source=service
+            - --provider=aws
+            - --aws-zone-type=public
+
+            # The domain filter is matched against HOSTED ZONE NAMES, not
+            # only against record names. It must therefore name the zone
+            # itself.
+            #
+            # Setting it to sawibowo.sandbox.devopsinstitute.id looks tighter
+            # but is actually broken: the zone (sandbox.devopsinstitute.id) is
+            # the PARENT of that filter, not a subdomain of it, so zero zones
+            # match and ExternalDNS silently creates nothing while logging
+            # "no changes for the matching hosted zones".
+            - --domain-filter={{ .Values.externalDns.domainFilter }}
+
+            # Pin the exact zone. Belt and braces with the filter above, and
+            # it stops ExternalDNS touching any other zone in the account.
+            - --zone-id-filter={{ .Values.global.hostedZoneId }}
+
+            # THE safety rail for a zone shared with ~30 other learners.
+            # ExternalDNS records ownership in a companion TXT record and will
+            # only modify or delete records whose TXT names this owner. It
+            # cannot touch anyone else's records even though the domain filter
+            # is now zone-wide. The IAM policy in terraform/irsa.tf also scopes
+            # ChangeResourceRecordSets to this one zone.
+            - --registry=txt
+            - --txt-owner-id={{ .Values.externalDns.txtOwnerId }}
+            - --txt-prefix={{ .Values.externalDns.txtPrefix }}
+
+            # sync (rather than upsert-only) lets ExternalDNS DELETE records
+            # when an Ingress is removed - so teardown is clean and does not
+            # leave dangling names pointing at a destroyed ALB.
+            - --policy={{ .Values.externalDns.policy }}
+
+            - --interval=1m
+            - --log-level=info
+            - --log-format=json
+            - --metrics-address=:7979
+          ports:
+            - name: metrics
+              containerPort: 7979
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+            limits: { memory: 128Mi }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 7979 }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+{{- end }}

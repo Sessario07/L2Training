@@ -1,0 +1,23 @@
+{{- $ns := include "l2lab.appNs" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: {{ $ns }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  labels:
+    {{- include "l2lab.labels" . | nindent 4 }}
+data:
+  # Fully-qualified DNS names. The short form triggers search-domain expansion
+  # (up to five queries per lookup); at high request rates that difference is
+  # enough to overload CoreDNS.
+  REDIS_ADDR: {{ include "l2lab.svcFqdn" (list . "redis" $ns) }}:6379
+  NATS_URL: nats://{{ include "l2lab.svcFqdn" (list . "nats" $ns) }}:4222
+  # Base URL only - the OTel SDK appends /v1/traces itself. Giving it a
+  # complete URL makes it POST to "/" and Tempo answers 404, which fails
+  # quietly: the app keeps serving and only an INFO line mentions it.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://{{ include "l2lab.svcFqdn" (list . "tempo" (include "l2lab.obsNs" .)) }}:4318
+  MIGRATIONS_DIR: /migrations
+  LOG_LEVEL: {{ .Values.app.config.logLevel | quote }}
+  APP_ENV: {{ .Values.app.config.appEnv | quote }}
