@@ -1,0 +1,152 @@
+---
+# Destroy everything, in an order that actually works.
+#
+#   ansible-playbook ops/teardown.yml -e confirm=yes
+#
+# ORDER MATTERS, and this is the single most common way a Terraform destroy
+# fails in the real world:
+#
+#   The AWS Load Balancer Controller created an ALB. That ALB owns ENIs in the
+#   VPC subnets. Terraform does not know the ALB exists - it was created by a
+#   controller inside the cluster, not by Terraform - so `terraform destroy`
+#   tries to delete the subnets, AWS refuses because an ENI is attached, and
+#   the destroy hangs for 20 minutes before failing.
+#
+#   The fix is to delete the Kubernetes Ingress objects FIRST, wait for the
+#   controller to tear down the ALB, and only then destroy the infrastructure.
+#
+# The same applies to ExternalDNS: deleting the Ingress lets it clean up its
+# Route53 records. Skip that and you leave dangling DNS pointing at nothing,
+# in a zone shared with thirty other people.
+
+- name: Tear down the l2lab environment
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    confirm: "no"
+    keep_backups: true
+
+  tasks:
+    - name: Require confirmation
+      ansible.builtin.assert:
+        that: confirm | string | lower in ['yes', 'true']
+        fail_msg: "This destroys everything. Re-run with -e confirm=yes"
+
+    # ------------------------------------------ 1. AWS resources owned by k8s
+    - name: Delete the Ingress objects first
+      kubernetes.core.k8s:
+        state: absent
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        namespace: "{{ item.ns }}"
+        name: "{{ item.name }}"
+        wait: true
+        wait_timeout: 180
+      loop:
+        - { ns: "{{ ns_app }}", name: app }
+        - { ns: "{{ ns_obs }}", name: grafana }
+      failed_when: false
+
+    - name: Wait for the controller to actually delete the ALB
+      ansible.builtin.command: >-
+        aws elbv2 describe-load-balancers --region {{ aws_region }}
+        --query "LoadBalancers[?contains(LoadBalancerName, 'k8s-l2lab')].LoadBalancerArn"
+        --output text
+      register: albs
+      until: albs.stdout | trim == ""
+      retries: 20
+      delay: 15
+      changed_when: false
+      failed_when: false
+
+    - name: Report ALB state
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'ALB removed.' if albs.stdout | trim == ''
+             else 'WARNING: an ALB still exists: ' ~ albs.stdout ~
+                  ' - terraform destroy may fail on the VPC.' }}
+
+    # ---------------------------------------------------- 2. cluster workloads
+    - name: Delete workloads
+      ansible.builtin.command: "kubectl delete -k {{ k8s_dir }}/{{ item }} --ignore-not-found --timeout=300s"
+      loop: [hardening, app, observability, data, platform]
+      changed_when: true
+      failed_when: false
+
+    # PVCs have reclaimPolicy: Delete, so removing them removes the EBS
+    # volumes. Leaving them behind means paying for orphaned disks that
+    # Terraform never knew about.
+    - name: Delete PVCs so their EBS volumes go too
+      ansible.builtin.command: >-
+        kubectl delete pvc --all -n {{ item }} --ignore-not-found --timeout=180s
+      loop: ["{{ ns_app }}", "{{ ns_obs }}"]
+      changed_when: true
+      failed_when: false
+
+    # -------------------------------------------------------- 3. infrastructure
+    - name: terraform destroy
+      ansible.builtin.command:
+        cmd: terraform destroy -auto-approve -input=false
+        chdir: "{{ terraform_dir }}"
+      changed_when: true
+      register: destroyed
+      failed_when: false
+
+    - name: Show the tail of the destroy output
+      ansible.builtin.debug:
+        var: destroyed.stdout_lines[-25:]
+
+    # ------------------------------------------------------------ 4. leftovers
+    - name: Check for orphaned resources
+      ansible.builtin.shell:
+        cmd: "{{ item.cmd }}"
+      register: orphan_checks
+      changed_when: false
+      failed_when: false
+      loop:
+        - name: "load balancers"
+          cmd: >-
+            aws elbv2 describe-load-balancers --region {{ aws_region }}
+            --query "LoadBalancers[?contains(LoadBalancerName,'l2lab')].LoadBalancerName"
+            --output text
+        - name: "VPCs"
+          cmd: >-
+            aws ec2 describe-vpcs --region {{ aws_region }}
+            --filters Name=tag:Project,Values={{ project }}
+            --query 'Vpcs[].VpcId' --output text
+        - name: "available EBS volumes"
+          cmd: >-
+            aws ec2 describe-volumes --region {{ aws_region }}
+            --filters Name=status,Values=available
+            --query "Volumes[?Tags[?Value=='owned' && starts_with(Key, 'kubernetes.io/cluster/{{ project }}')]].VolumeId"
+            --output text
+        - name: "Route53 records under our subdomain"
+          cmd: >-
+            aws route53 list-resource-record-sets
+            --hosted-zone-id Z0646008ZGZY2INOOAOG
+            --query "ResourceRecordSets[?contains(Name,'{{ domain.split('.')[0] }}')].Name"
+            --output text
+        - name: "secrets pending deletion"
+          cmd: >-
+            aws secretsmanager list-secrets --region {{ aws_region }}
+            --include-planned-deletion
+            --query "SecretList[?contains(Name,'{{ project }}')].Name"
+            --output text
+      loop_control: { label: "{{ item.name }}" }
+
+    - name: Orphan report
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.name }}:
+          {{ item.stdout | trim if item.stdout | trim else 'none - clean' }}
+      loop: "{{ orphan_checks.results }}"
+      loop_control: { label: "{{ item.item.name }}" }
+
+    - name: Final note
+      ansible.builtin.debug:
+        msg:
+          - "Teardown complete."
+          - "Anything listed above as non-empty needs manual cleanup."
+          - "This account is shared and its VPC quota was already 52/70,"
+          - "so leaking a VPC affects other people, not just you."

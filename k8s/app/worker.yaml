@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: l2lab
+  labels: { app: worker }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: worker }
+  template:
+    metadata:
+      labels: { app: worker }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: worker
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: worker
+          image: l2lab-app:latest    # replaced by `kustomize edit set image`
+          imagePullPolicy: IfNotPresent
+          # Same image, different binary. One build, two workloads - which
+          # also guarantees the API and worker can never drift out of sync.
+          command: ["/worker"]
+          ports:
+            - name: http
+              containerPort: 8081
+          envFrom:
+            - configMapRef: { name: app-config }
+          env:
+            # Read from the CSI-mounted file rather than an env var. See
+            # app/internal/obs/env.go for why: it avoids the ordering problem
+            # with secretKeyRef, and keeps the DSN out of process environments
+            # and crash dumps.
+            - name: DATABASE_URL_FILE
+              value: /mnt/secrets/postgres-url
+            - name: LISTEN_ADDR
+              value: ":8081"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+          volumeMounts:
+            - name: secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { memory: 128Mi }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+            periodSeconds: 20
+            failureThreshold: 3
+          # No readiness probe: the worker takes no inbound traffic, so there
+          # is no target group to add or remove it from.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: postgres

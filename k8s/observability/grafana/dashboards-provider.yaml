@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: observability
+data:
+  provider.yaml: |
+    # Dashboards are provisioned from files, not clicked together in the UI.
+    # That means they are version-controlled and survive a cluster rebuild -
+    # a dashboard that only exists in one person's browser is a liability.
+    apiVersion: 1
+    providers:
+      - name: l2lab
+        orgId: 1
+        folder: l2lab
+        type: file
+        disableDeletion: false
+        allowUiUpdates: true
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+          foldersFromFilesStructure: false

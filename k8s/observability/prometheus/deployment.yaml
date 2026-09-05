@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+  labels: { app: prometheus }
+spec:
+  selector: { app: prometheus }
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  serviceName: prometheus
+  replicas: 1
+  selector:
+    matchLabels: { app: prometheus }
+  template:
+    metadata:
+      labels: { app: prometheus }
+    spec:
+      serviceAccountName: prometheus
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsUser: 65534        # nobody, as shipped in the prom/prometheus image
+        runAsGroup: 65534
+        runAsNonRoot: true
+        fsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.7.3
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            # 6h retention. This lab lives for a weekend; long retention only
+            # buys disk cost. Real production runs 15d locally and ships older
+            # data to remote storage.
+            - --storage.tsdb.retention.time=6h
+            - --web.enable-lifecycle
+            # Exemplars are what let you click a spike on a latency histogram
+            # and jump straight to the trace that caused it. Off by default.
+            - --enable-feature=exemplar-storage
+            # Lets Tempo's metrics-generator push span metrics and service
+            # graphs in. That is what draws the automatic service topology
+            # diagram in Grafana without any manual configuration.
+            - --web.enable-remote-write-receiver
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: rules,  mountPath: /etc/prometheus/rules }
+            - { name: data,   mountPath: /prometheus }
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            # Prometheus is memory-hungry and its usage scales with the number
+            # of active time series. If this OOMKills, the cause is almost
+            # always a high-cardinality label somebody added.
+            limits: { memory: 1Gi }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: 9090 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: 9090 }
+            periodSeconds: 30
+            failureThreshold: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-config }
+        - name: rules
+          configMap: { name: prometheus-rules }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests: { storage: 8Gi }

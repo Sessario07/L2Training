@@ -1,0 +1,31 @@
+# EKS ships a default `gp2` StorageClass. gp3 is cheaper per GB, and lets you
+# set IOPS and throughput independently of volume size - on gp2 the only way to
+# get more IOPS is to buy a bigger disk.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+
+  # Tag the EBS volumes the driver creates. Without these, a PVC's volume
+  # carries only kubernetes.io/cluster/... and CSIVolumeName - so it is
+  # invisible to cost attribution by Owner, and impossible to tell apart from
+  # the other ~30 learners' volumes in the console.
+  #
+  # The tagSpecification_<N> parameter names must be consecutive from 1.
+  tagSpecification_1: "Name=l2lab-sawibowo-{{ .PVCNamespace }}-{{ .PVCName }}"
+  tagSpecification_2: "Project=l2lab-sawibowo"
+  tagSpecification_3: "Owner=sawibowo"
+  tagSpecification_4: "ManagedBy=kubernetes"
+reclaimPolicy: Delete       # lab setting: deletes the EBS volume with the PVC
+allowVolumeExpansion: true
+# WaitForFirstConsumer is important. EBS volumes are locked to one AZ, so the
+# volume must not be created until the scheduler has decided which AZ the pod
+# lands in. With Immediate binding you get pods stuck Pending forever because
+# the disk is in AZ-b and the only free node is in AZ-c.
+volumeBindingMode: WaitForFirstConsumer

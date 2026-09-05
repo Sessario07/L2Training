@@ -1,0 +1,34 @@
+# Second Ingress, SAME group.name as the app's. The controller merges both
+# into a single ALB with host-based routing rules - one load balancer, two
+# hostnames, one bill.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: observability
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/group.name: l2lab
+    alb.ingress.kubernetes.io/group.order: "30"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/healthcheck-path: /api/health
+    external-dns.alpha.kubernetes.io/hostname: grafana.sawibowo.sandbox.devopsinstitute.id
+    # Tags applied to the ALB, its target groups and its security groups.
+    # The controller creates these outside Terraform, so they would otherwise
+    # carry no ownership tags at all.
+    alb.ingress.kubernetes.io/tags: Name=l2lab-sawibowo-alb,Project=l2lab-sawibowo,Owner=sawibowo,ManagedBy=kubernetes
+spec:
+  ingressClassName: alb
+  rules:
+    - host: grafana.sawibowo.sandbox.devopsinstitute.id
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000

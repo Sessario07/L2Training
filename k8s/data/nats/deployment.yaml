@@ -1,0 +1,92 @@
+# NATS: the message bus between the API and the worker.
+#
+# A Deployment, not a StatefulSet, because we use CORE NATS (fire-and-forget
+# pub/sub) rather than JetStream. There is no disk and no persistence: if NATS
+# restarts, in-flight messages are gone.
+#
+# That is a real tradeoff, and a useful one to understand. It means a NATS
+# restart leaves some timelines stale until their 30s TTL expires - degraded,
+# not broken. JetStream would give durability at the cost of a StatefulSet,
+# a PVC, stream configuration and consumer management.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: l2lab
+data:
+  nats.conf: |
+    port: 4222
+    http: 8222          # /varz, /connz, /subsz monitoring endpoints
+
+    max_payload: 1MB
+    max_connections: 1000
+
+    # Slow consumers are disconnected rather than allowed to balloon the
+    # server's memory. If the worker cannot keep up, NATS drops it - which
+    # shows up as a reconnect loop rather than a NATS OOMKill.
+    write_deadline: "5s"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: l2lab
+  labels: { app: nats }
+spec:
+  selector: { app: nats }
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+    - name: monitor
+      port: 8222
+      targetPort: 8222
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  namespace: l2lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: nats }
+  template:
+    metadata:
+      labels: { app: nats }
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: nats
+          image: nats:2.11-alpine
+          imagePullPolicy: IfNotPresent
+          args: ["-c", "/etc/nats/nats.conf"]
+          ports:
+            - name: client
+              containerPort: 4222
+            - name: monitor
+              containerPort: 8222
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { memory: 128Mi }
+          # /healthz is NATS's own health endpoint on the monitoring port.
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8222 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8222 }
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: nats-config }

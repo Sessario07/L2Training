@@ -1,0 +1,308 @@
+---
+# Full build: AWS infrastructure -> container image -> Kubernetes workloads.
+#
+#   ansible-playbook site.yml
+#   ansible-playbook site.yml --tags k8s        # skip terraform and the image
+#   ansible-playbook site.yml --check           # terraform plan only, no apply
+#
+# This is the same sequence as `make up`, with three things a Makefile does
+# badly: real idempotency (it will not rebuild an unchanged image), retries on
+# the things that are genuinely flaky, and readable failure output.
+
+- name: Build the l2lab environment
+  hosts: localhost
+  gather_facts: true
+
+  tasks:
+
+    # ---------------------------------------------------------------- checks
+    - name: Verify required tools are installed
+      ansible.builtin.command: "which {{ item }}"
+      register: tool_check
+      changed_when: false
+      failed_when: tool_check.rc != 0
+      loop: [terraform, kubectl, aws, docker]
+      tags: [always]
+
+    - name: Verify AWS credentials work and we are in the right account
+      ansible.builtin.command: aws sts get-caller-identity --output json
+      register: caller
+      changed_when: false
+      tags: [always]
+
+    - name: Fail early if pointed at the wrong AWS account
+      ansible.builtin.assert:
+        that: (caller.stdout | from_json).Account == aws_account
+        fail_msg: >-
+          Wrong AWS account: expected {{ aws_account }}, got
+          {{ (caller.stdout | from_json).Account }}. Check your AWS profile.
+        success_msg: "AWS account {{ aws_account }} confirmed"
+      tags: [always]
+
+    # ------------------------------------------------------------- terraform
+    - name: Fetch the AWS Load Balancer Controller IAM policy
+      ansible.builtin.get_url:
+        url: >-
+          https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.13.4/docs/install/iam_policy.json
+        dest: "{{ terraform_dir }}/policies/aws-lbc-iam-policy.json"
+        mode: "0644"
+      tags: [vendor, terraform]
+
+    - name: Fetch the AWS Load Balancer Controller manifests
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/kubernetes-sigs/aws-load-balancer-controller/releases/download/v2.13.4/v2_13_4_full.yaml
+        dest: "{{ k8s_dir }}/platform/aws-lbc/upstream.yaml"
+        mode: "0644"
+      tags: [vendor, k8s]
+
+    - name: terraform init
+      ansible.builtin.command:
+        cmd: terraform init -input=false
+        chdir: "{{ terraform_dir }}"
+      register: tf_init
+      changed_when: "'has been successfully initialized' in tf_init.stdout"
+      tags: [terraform]
+
+    - name: terraform plan
+      ansible.builtin.command:
+        cmd: terraform plan -input=false -detailed-exitcode -out=tfplan
+        chdir: "{{ terraform_dir }}"
+      register: tf_plan
+      # -detailed-exitcode: 0 = no changes, 2 = changes pending, 1 = error.
+      # This is what makes the play genuinely idempotent instead of just
+      # re-running apply every time.
+      failed_when: tf_plan.rc not in [0, 2]
+      changed_when: tf_plan.rc == 2
+      tags: [terraform]
+
+    - name: terraform apply
+      ansible.builtin.command:
+        cmd: terraform apply -input=false tfplan
+        chdir: "{{ terraform_dir }}"
+      when: tf_plan.rc == 2 and not ansible_check_mode
+      changed_when: true
+      tags: [terraform]
+
+    - name: Read terraform outputs
+      ansible.builtin.command:
+        cmd: terraform output -json
+        chdir: "{{ terraform_dir }}"
+      register: tf_out
+      changed_when: false
+      tags: [always]
+
+    - name: Register outputs as facts
+      ansible.builtin.set_fact:
+        tf: "{{ tf_out.stdout | from_json | dict2items | items2dict(key_name='key', value_name='value') | combine({}) }}"
+      tags: [always]
+
+    - name: Extract the values we need
+      ansible.builtin.set_fact:
+        ecr_api: "{{ (tf_out.stdout | from_json).ecr_api.value }}"
+        ecr_frontend: "{{ (tf_out.stdout | from_json).ecr_frontend.value }}"
+        ecr_registry: "{{ (tf_out.stdout | from_json).ecr_registry.value }}"
+        cluster_name: "{{ (tf_out.stdout | from_json).cluster_name.value }}"
+      tags: [always]
+
+    # ------------------------------------------------------------ kubeconfig
+    - name: Update kubeconfig
+      ansible.builtin.command: >-
+        aws eks update-kubeconfig --region {{ aws_region }} --name {{ cluster_name }}
+      register: kubecfg
+      changed_when: "'Updated context' in kubecfg.stdout"
+      tags: [always]
+
+    - name: Wait for the Kubernetes API to answer
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: nodes
+      retries: 30
+      delay: 10
+      until: nodes.resources | length > 0
+      tags: [k8s]
+
+    - name: Report nodes
+      ansible.builtin.debug:
+        msg: >-
+          {{ nodes.resources | length }} node(s):
+          {{ nodes.resources | map(attribute='metadata.name') | join(', ') }}
+      tags: [k8s]
+
+    # ----------------------------------------------------------------- image
+    - name: Determine the image tag from git
+      ansible.builtin.command: git rev-parse --short HEAD
+      register: git_sha
+      changed_when: false
+      failed_when: false
+      tags: [image]
+
+    - name: Set the image tag
+      ansible.builtin.set_fact:
+        # An immutable, traceable tag. Never :latest — during an incident you
+        # must be able to say exactly which code is running.
+        image_tag: >-
+          {{ git_sha.stdout if git_sha.rc == 0 and git_sha.stdout else
+             ansible_date_time.iso8601_basic_short }}
+      tags: [image]
+
+    - name: Check whether these tags are already in ECR
+      ansible.builtin.command: >-
+        aws ecr describe-images --region {{ aws_region }}
+        --repository-name {{ project }}/{{ item }}
+        --image-ids imageTag={{ image_tag }}
+      register: existing_images
+      changed_when: false
+      failed_when: false
+      loop: [api, frontend]
+      tags: [image]
+
+    - name: Decide whether a build is needed
+      ansible.builtin.set_fact:
+        # Rebuild if EITHER image is missing at this tag.
+        needs_build: "{{ existing_images.results | selectattr('rc', 'ne', 0) | list | length > 0 }}"
+      tags: [image]
+
+    - name: Log docker in to ECR
+      ansible.builtin.shell:
+        cmd: >-
+          aws ecr get-login-password --region {{ aws_region }}
+          | docker login --username AWS --password-stdin {{ ecr_registry }}
+      when: needs_build | bool
+      changed_when: true
+      tags: [image]
+
+    - name: Build the API image
+      ansible.builtin.command:
+        cmd: >-
+          docker build --platform linux/arm64 --build-arg TARGETARCH=arm64
+          -t {{ ecr_api }}:{{ image_tag }} .
+        chdir: "{{ app_dir }}"
+      when: needs_build | bool
+      changed_when: true
+      tags: [image]
+
+    - name: Build the frontend image
+      ansible.builtin.command:
+        cmd: "docker build --platform linux/arm64 -t {{ ecr_frontend }}:{{ image_tag }} ."
+        chdir: "{{ repo_root }}/frontend"
+      when: needs_build | bool
+      changed_when: true
+      tags: [image]
+
+    - name: Push both images
+      ansible.builtin.command: "docker push {{ item }}:{{ image_tag }}"
+      loop: ["{{ ecr_api }}", "{{ ecr_frontend }}"]
+      when: needs_build | bool
+      changed_when: true
+      tags: [image]
+
+    - name: Report images already present
+      ansible.builtin.debug:
+        msg: "Both images already in ECR at :{{ image_tag }} — skipping build"
+      when: not (needs_build | bool)
+      tags: [image]
+
+    # ------------------------------------------------------------------- k8s
+    - name: Apply namespaces and storage class
+      ansible.builtin.command: "kubectl apply -k {{ k8s_dir }}/base"
+      register: r
+      changed_when: "'created' in r.stdout or 'configured' in r.stdout"
+      tags: [k8s]
+
+    - name: Apply platform controllers
+      # --server-side avoids the last-applied-configuration annotation size
+      # limit, which the load balancer controller's CRDs exceed.
+      ansible.builtin.command: >-
+        kubectl apply -k {{ k8s_dir }}/platform --server-side --force-conflicts
+      register: r
+      changed_when: "'created' in r.stdout or 'configured' in r.stdout"
+      tags: [k8s, platform]
+
+    - name: Wait for the platform controllers
+      ansible.builtin.command: >-
+        kubectl -n {{ ns_sys }} rollout status deploy/{{ item }}
+        --timeout={{ timeouts.rollout }}s
+      loop: [aws-load-balancer-controller, external-dns]
+      changed_when: false
+      tags: [k8s, platform]
+
+    - name: Apply the data layer
+      ansible.builtin.command: "kubectl apply -k {{ k8s_dir }}/data"
+      register: r
+      changed_when: "'created' in r.stdout or 'configured' in r.stdout"
+      tags: [k8s, data]
+
+    - name: Wait for the data layer
+      ansible.builtin.command: >-
+        kubectl -n {{ ns_app }} rollout status {{ item }}
+        --timeout={{ timeouts.rollout }}s
+      loop: [sts/postgres, sts/redis, deploy/nats]
+      changed_when: false
+      tags: [k8s, data]
+
+    - name: Apply the observability stack
+      ansible.builtin.command: "kubectl apply -k {{ k8s_dir }}/observability"
+      register: r
+      changed_when: "'created' in r.stdout or 'configured' in r.stdout"
+      tags: [k8s, observability]
+
+    - name: Wait for the observability stack
+      ansible.builtin.command: >-
+        kubectl -n {{ ns_obs }} rollout status {{ item }}
+        --timeout={{ timeouts.rollout }}s
+      loop: [sts/prometheus, sts/grafana, sts/loki, sts/tempo, sts/alertmanager]
+      changed_when: false
+      tags: [k8s, observability]
+
+    - name: Point the manifests at the images just pushed
+      # Uses our own script rather than `kustomize edit`, which needs the
+      # standalone kustomize CLI. kubectl only embeds the build half.
+      ansible.builtin.command:
+        cmd: >-
+          {{ repo_root }}/scripts/set-image.py {{ k8s_dir }}/app
+          l2lab-app={{ ecr_api }}:{{ image_tag }}
+          l2lab-frontend={{ ecr_frontend }}:{{ image_tag }}
+      changed_when: true
+      tags: [k8s, app]
+
+    - name: Apply the application
+      ansible.builtin.command: "kubectl apply -k {{ k8s_dir }}/app"
+      register: r
+      changed_when: "'created' in r.stdout or 'configured' in r.stdout"
+      tags: [k8s, app]
+
+    - name: Record why this rollout happened
+      # Populates CHANGE-CAUSE in `kubectl rollout history`. Without it that
+      # command prints a useless column of <none>.
+      ansible.builtin.command: >-
+        kubectl -n {{ ns_app }} annotate deployment/{{ item }} --overwrite
+        kubernetes.io/change-cause=ansible site.yml tag={{ image_tag }}
+      loop: [app, frontend, worker]
+      changed_when: true
+      tags: [k8s, app]
+
+    - name: Wait for the application
+      ansible.builtin.command: >-
+        kubectl -n {{ ns_app }} rollout status deploy/{{ item }}
+        --timeout={{ timeouts.rollout }}s
+      loop: [app, frontend, worker]
+      changed_when: false
+      tags: [k8s, app]
+
+    # ---------------------------------------------------------------- report
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "cluster : {{ cluster_name }}"
+          - "api     : {{ ecr_api }}:{{ image_tag }}"
+          - "frontend: {{ ecr_frontend }}:{{ image_tag }}"
+          - "app     : https://{{ app_host }}"
+          - "grafana : https://{{ grafana_host }}"
+          - ""
+          - "Grafana password:"
+          - "  aws secretsmanager get-secret-value --region {{ aws_region }}"
+          - "    --secret-id {{ secret_grafana }} --query SecretString --output text | jq -r '.\"admin-password\"'"
+          - ""
+          - "Next: ansible-playbook verify.yml"
+      tags: [always]

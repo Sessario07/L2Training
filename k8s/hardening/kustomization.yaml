@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Applied SEPARATELY from the base stack, via `make harden`.
+#
+# Get the cluster green first, then add segmentation and quotas. If you apply
+# these at the same time as everything else and something does not come up,
+# you will not know whether it is a NetworkPolicy, a quota, or a genuine bug.
+resources:
+  - networkpolicy.yaml
+  - quotas.yaml
+  - backup-cronjob.yaml

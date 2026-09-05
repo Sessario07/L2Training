@@ -1,0 +1,204 @@
+# PostgreSQL as a StatefulSet.
+#
+# A StatefulSet rather than a Deployment because this pod owns a disk. It gets
+# a stable name (postgres-0) and a stable PVC that survives a restart or a
+# reschedule. A Deployment would happily create a second pod pointing at the
+# same volume, which corrupts the database.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: l2lab
+  labels: { app: postgres }
+spec:
+  # Headless (clusterIP: None): DNS resolves straight to the pod IP. That gives
+  # you the stable address postgres-0.postgres.l2lab.svc.cluster.local.
+  clusterIP: None
+  selector: { app: postgres }
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: l2lab
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+        prometheus.io/path: /metrics
+    spec:
+      # This ServiceAccount carries the IRSA annotation that lets the CSI
+      # driver fetch the password from AWS Secrets Manager.
+      serviceAccountName: postgres
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # The postgres image's default USER is root and its entrypoint drops
+        # privileges itself. The `restricted` Pod Security Standard on this
+        # namespace forbids that, so we pin the UID explicitly. 70 is the
+        # postgres user in the Alpine-based image.
+        runAsUser: 70
+        runAsGroup: 70
+        runAsNonRoot: true
+        # fsGroup makes the kubelet chown the mounted EBS volume to this group,
+        # which is what makes the data directory writable by a non-root process.
+        fsGroup: 70
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          imagePullPolicy: IfNotPresent
+
+          # Passed straight through to the `postgres` binary by the image's
+          # entrypoint (it prepends `postgres` when the first arg starts with
+          # a dash). Cleaner than replacing postgresql.conf wholesale, which
+          # would mean owning every default too.
+          args:
+            # pg_stat_statements is THE tool for "which query is slow". It has
+            # to be preloaded at startup - it cannot be enabled at runtime,
+            # which is why turning it on costs a restart.
+            - -c
+            - shared_preload_libraries=pg_stat_statements
+            - -c
+            - pg_stat_statements.max=5000
+            - -c
+            - pg_stat_statements.track=all
+            # Real read/write time per query rather than just block counts.
+            # Has a small measurable overhead; worth it, and worth knowing
+            # that you are paying it.
+            - -c
+            - track_io_timing=on
+            - -c
+            - track_functions=pl
+            # Log slow queries and lock waits so Loki sees them too.
+            - -c
+            - log_min_duration_statement=500
+            - -c
+            - log_lock_waits=on
+            - -c
+            - log_checkpoints=on
+            - -c
+            - log_autovacuum_min_duration=0
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: l2lab
+            - name: POSTGRES_USER
+              value: l2lab
+            # The official Postgres image supports the _FILE convention
+            # natively. Nothing here ever holds the password in an env var.
+            - name: POSTGRES_PASSWORD_FILE
+              value: /mnt/secrets/postgres-password
+            # PGDATA must be a SUBDIRECTORY of the mount point. An EBS volume
+            # arrives with a lost+found directory, and initdb refuses to
+            # initialise into a non-empty directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            # No CPU limit on purpose: CPU is compressible, so a limit only
+            # buys you throttling. Memory IS limited, because exceeding it
+            # means an OOMKill rather than graceful degradation.
+            limits: { memory: 512Mi }
+          # Startup probe covers first boot, where initdb can take a while.
+          # Without it, an aggressive liveness probe kills the pod mid-initdb
+          # and you get an infinite crash loop.
+          startupProbe:
+            exec: { command: ["pg_isready", "-U", "l2lab", "-d", "l2lab"] }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "l2lab", "-d", "l2lab"] }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec: { command: ["pg_isready", "-U", "l2lab", "-d", "l2lab"] }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+
+        # --- metrics sidecar ------------------------------------------------
+        # A sidecar rather than a separate Deployment so it reaches Postgres on
+        # 127.0.0.1 (same network namespace), needs no Service, and is
+        # guaranteed to disappear when the database pod does.
+        - name: exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.19.0
+          # The exporter takes its DSN from DATA_SOURCE_NAME, and the CSI
+          # driver gives it to us as a file. A one-line shell wrapper reads the
+          # file into the env var, so the credential never appears in the pod
+          # spec, in `kubectl describe`, or in any env dump.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export DATA_SOURCE_NAME="$(cat /mnt/secrets/postgres-monitor-url)"
+              exec /bin/postgres_exporter                 --collector.stat_statements                 --collector.stat_statements.include_query                 --collector.stat_statements.limit=100                 --collector.long_running_transactions                 --collector.locks                 --collector.stat_activity_autovacuum                 --collector.statio_user_tables                 --collector.stat_user_tables                 --collector.stat_wal_receiver                 --collector.database_wraparound                 --collector.process_idle                 --web.listen-address=:9187
+          ports:
+            - name: metrics
+              containerPort: 9187
+          volumeMounts:
+            - name: secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+          resources:
+            requests: { cpu: 25m, memory: 48Mi }
+            limits: { memory: 128Mi }
+          # NO readinessProbe on purpose, and this is important.
+          #
+          # A container's readiness contributes to the POD's readiness. The
+          # postgres Service is headless, so DNS only publishes endpoints for
+          # READY pods. Giving this sidecar a readiness probe therefore
+          # created a deadlock:
+          #
+          #   exporter not ready (monitoring role does not exist yet)
+          #     -> pod not ready
+          #     -> postgres.l2lab.svc.cluster.local returns NXDOMAIN
+          #     -> the Job that creates the role cannot connect
+          #     -> the role is never created
+          #
+          # ...and it took the application down with it, because the app could
+          # no longer resolve the database either.
+          #
+          # A metrics sidecar must NEVER gate the readiness of the thing it
+          # observes. If the exporter is broken, you lose metrics - you must
+          # not also lose the database.
+          securityContext:
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: postgres
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests: { storage: 8Gi }

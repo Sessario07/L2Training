@@ -1,0 +1,93 @@
+---
+# Scale the node group up and down, to stop paying for compute overnight.
+#
+#   ansible-playbook ops/scale.yml -e state=sleep
+#   ansible-playbook ops/scale.yml -e state=wake
+#
+# What this does NOT stop: the EKS control plane ($0.10/hr), the NAT Gateway
+# ($0.045/hr), the ALB, or EBS storage. Sleeping takes the bill from about
+# $0.22/hr to about $0.16/hr. If you are finished for the day, `make down` is
+# the honest answer; this is for a lunch break, not a weekend.
+
+- name: Scale the cluster
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    state: ""
+
+  tasks:
+    - name: Validate
+      ansible.builtin.assert:
+        that: state in ['sleep', 'wake', 'status']
+        fail_msg: "Usage: -e state=sleep|wake|status"
+
+    - name: Read the current node group configuration
+      ansible.builtin.command: >-
+        aws eks describe-nodegroup --region {{ aws_region }}
+        --cluster-name {{ project }} --nodegroup-name {{ nodegroup }}
+        --query 'nodegroup.{status:status,scaling:scalingConfig,types:instanceTypes,capacity:capacityType}'
+        --output json
+      register: ng
+      changed_when: false
+
+    - name: Current state
+      ansible.builtin.debug:
+        msg: "{{ ng.stdout | from_json }}"
+
+    - name: Stop here if only checking status
+      ansible.builtin.meta: end_play
+      when: state == 'status'
+
+    - name: Work out the target size
+      ansible.builtin.set_fact:
+        target_min: "{{ 0 if state == 'sleep' else node_min }}"
+        target_desired: "{{ 0 if state == 'sleep' else node_desired }}"
+
+    - name: Skip if already there
+      ansible.builtin.debug:
+        msg: "Node group is already at desiredSize={{ target_desired }} - nothing to do"
+      when: (ng.stdout | from_json).scaling.desiredSize | int == target_desired | int
+
+    - name: Scale the node group
+      ansible.builtin.command: >-
+        aws eks update-nodegroup-config --region {{ aws_region }}
+        --cluster-name {{ project }} --nodegroup-name {{ nodegroup }}
+        --scaling-config minSize={{ target_min }},maxSize={{ node_max }},desiredSize={{ target_desired }}
+      when: (ng.stdout | from_json).scaling.desiredSize | int != target_desired | int
+      changed_when: true
+
+    - name: Wait for nodes to come back
+      when: state == 'wake'
+      block:
+        - name: Poll for Ready nodes
+          kubernetes.core.k8s_info:
+            kind: Node
+          register: nodes
+          retries: 40
+          delay: 15
+          until: >-
+            nodes.resources | length >= node_min | int
+            and nodes.resources
+                | map(attribute='status.conditions') | flatten
+                | selectattr('type', 'eq', 'Ready')
+                | selectattr('status', 'eq', 'True') | list | length
+                >= node_min | int
+
+        - name: Wait for the workloads to reschedule
+          ansible.builtin.command: >-
+            kubectl -n {{ item.ns }} rollout status {{ item.obj }} --timeout=600s
+          loop:
+            - { ns: "{{ ns_app }}", obj: "sts/postgres" }
+            - { ns: "{{ ns_app }}", obj: "sts/redis" }
+            - { ns: "{{ ns_app }}", obj: "deploy/app" }
+            - { ns: "{{ ns_obs }}", obj: "sts/prometheus" }
+            - { ns: "{{ ns_obs }}", obj: "sts/grafana" }
+          changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Node group scaling to zero. Control plane, NAT and EBS still bill (~$0.16/hr).'
+             if state == 'sleep'
+             else 'Cluster is awake. Run ansible-playbook verify.yml to confirm.' }}

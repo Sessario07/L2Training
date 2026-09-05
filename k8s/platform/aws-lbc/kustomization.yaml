@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  # Downloaded from upstream - see aws-lbc/README.md for the exact command.
+  # Vendored rather than fetched at apply time so the install is reproducible
+  # and reviewable: you can diff it, and it cannot change under you.
+  - upstream.yaml
+  # Not shipped by upstream - only the Helm chart creates it. See the file.
+  - ingressclass.yaml
+
+patches:
+  # The upstream manifests ship a ServiceAccount with no IRSA annotation and
+  # a Deployment that does not know the cluster name. Both must be supplied.
+  - path: patch-serviceaccount.yaml
+  - path: patch-deployment.yaml

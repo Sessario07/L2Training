@@ -1,0 +1,175 @@
+---
+# Restore PostgreSQL from an S3 backup.
+#
+#   ansible-playbook ops/restore-db.yml                      # newest backup
+#   ansible-playbook ops/restore-db.yml -e backup_key=postgres/l2lab-20260829T020000Z.dump
+#
+# THIS IS DESTRUCTIVE. It drops and recreates the schema. You must confirm
+# explicitly with -e confirm=yes.
+#
+# A backup you have never restored is not a backup - it is an untested
+# assumption. Run this at least once while nothing is on fire, so that the
+# first time you do it is not during an incident.
+
+- name: Restore PostgreSQL from S3
+  hosts: localhost
+  gather_facts: true
+
+  vars:
+    confirm: "no"
+    backup_key: ""
+    restore_pod: "restore-{{ ansible_date_time.epoch }}"
+
+  tasks:
+    - name: Refuse to run without explicit confirmation
+      ansible.builtin.assert:
+        that: confirm | string | lower in ['yes', 'true']
+        fail_msg: |
+          This DROPS the current database and replaces it with a backup.
+          Re-run with:  -e confirm=yes
+        success_msg: "Confirmed - proceeding with restore"
+
+    - name: List available backups
+      ansible.builtin.command: >-
+        aws s3api list-objects-v2 --bucket {{ backup_bucket }}
+        --prefix postgres/
+        --query "sort_by(Contents, &LastModified)[].{k:Key,size:Size,when:LastModified}"
+        --output json
+      register: backups
+      changed_when: false
+
+    - name: Fail if there are no backups
+      ansible.builtin.assert:
+        that: (backups.stdout | from_json | default([])) | length > 0
+        fail_msg: "No backups found in s3://{{ backup_bucket }}/postgres/"
+
+    - name: Show what is available
+      ansible.builtin.debug:
+        msg: "{{ backups.stdout | from_json }}"
+
+    - name: Choose the newest backup unless one was specified
+      ansible.builtin.set_fact:
+        chosen_key: >-
+          {{ backup_key if backup_key
+             else (backups.stdout | from_json | last).k }}
+
+    - name: Confirm the choice
+      ansible.builtin.debug:
+        msg: "Restoring from s3://{{ backup_bucket }}/{{ chosen_key }}"
+
+    # Scale the application down first. Restoring underneath live writers
+    # produces a database that matches neither the backup nor the old state.
+    - name: Scale the application to zero
+      kubernetes.core.k8s_scale:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ ns_app }}"
+        name: "{{ item }}"
+        replicas: 0
+        wait: true
+        wait_timeout: 120
+      loop: [app, worker]
+
+    - name: Run the restore in a temporary pod
+      # A throwaway pod with the backup ServiceAccount, so it inherits the
+      # IRSA role that can read both S3 and the database password.
+      ansible.builtin.shell:
+        cmd: |
+          kubectl run {{ restore_pod }} -n {{ ns_app }} \
+            --image=postgres:17-alpine \
+            --restart=Never \
+            --overrides='{
+              "spec": {
+                "serviceAccountName": "backup",
+                "containers": [{
+                  "name": "restore",
+                  "image": "postgres:17-alpine",
+                  "command": ["sleep", "900"],
+                  "volumeMounts": [{"name":"secrets","mountPath":"/mnt/secrets","readOnly":true}]
+                }],
+                "volumes": [{
+                  "name": "secrets",
+                  "csi": {
+                    "driver": "secrets-store.csi.k8s.io",
+                    "readOnly": true,
+                    "volumeAttributes": {"secretProviderClass": "backup"}
+                  }
+                }]
+              }
+            }'
+          kubectl wait -n {{ ns_app }} --for=condition=ready --timeout=120s pod/{{ restore_pod }}
+      changed_when: true
+
+    - name: Copy the dump into the pod
+      # Downloaded locally then copied in, because the postgres image has no
+      # AWS CLI. Two hops, but it avoids building a custom image.
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          aws s3 cp "s3://{{ backup_bucket }}/{{ chosen_key }}" "$TMP/restore.dump" --only-show-errors
+          ls -lh "$TMP/restore.dump"
+          kubectl cp "$TMP/restore.dump" "{{ ns_app }}/{{ restore_pod }}:/tmp/restore.dump"
+          rm -rf "$TMP"
+      changed_when: true
+
+    - name: Drop and recreate the schema, then restore
+      ansible.builtin.shell:
+        cmd: |
+          kubectl exec -n {{ ns_app }} {{ restore_pod }} -- sh -c '
+            set -eu
+            export PGPASSWORD="$(cat /mnt/secrets/postgres-password)"
+            HOST=postgres.{{ ns_app }}.svc.cluster.local
+            echo "dropping and recreating schema public"
+            psql -h "$HOST" -U l2lab -d l2lab -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+            echo "restoring"
+            pg_restore -h "$HOST" -U l2lab -d l2lab --no-owner --no-privileges /tmp/restore.dump
+            echo "row counts after restore:"
+            psql -h "$HOST" -U l2lab -d l2lab -c "
+              SELECT (SELECT count(*) FROM users) AS users,
+                     (SELECT count(*) FROM posts) AS posts,
+                     (SELECT count(*) FROM follows) AS follows,
+                     (SELECT count(*) FROM likes) AS likes;"
+          '
+      register: restore_result
+      changed_when: true
+
+    - name: Show the result
+      ansible.builtin.debug:
+        var: restore_result.stdout_lines
+
+    - name: Remove the temporary pod
+      kubernetes.core.k8s:
+        state: absent
+        kind: Pod
+        namespace: "{{ ns_app }}"
+        name: "{{ restore_pod }}"
+
+    # Sessions and cached timelines now reference rows that may no longer
+    # exist. Clearing Redis avoids a confusing period of stale reads.
+    - name: Flush Redis
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_app }}"
+        pod: redis-0
+        command: redis-cli FLUSHALL
+      changed_when: true
+
+    - name: Scale the application back up
+      kubernetes.core.k8s_scale:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ ns_app }}"
+        name: "{{ item.name }}"
+        replicas: "{{ item.n }}"
+        wait: true
+        wait_timeout: 180
+      loop:
+        - { name: app, n: 2 }
+        - { name: worker, n: 1 }
+
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "Restored from {{ chosen_key }}"
+          - "Everyone has been logged out (Redis was flushed)."
+          - "Verify: ansible-playbook ../verify.yml"

@@ -1,0 +1,145 @@
+# Redis: session store and timeline cache.
+#
+# Note this is a single instance with no replica. If it dies, every user is
+# logged out (sessions live here) and every timeline read falls through to
+# Postgres. That is a deliberate, visible single point of failure.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: l2lab
+data:
+  redis.conf: |
+    bind 0.0.0.0
+    protected-mode no
+
+    # Append-only file: survives a restart with at most 1 second of data loss.
+    appendonly yes
+    appendfsync everysec
+
+    # A hard memory ceiling BELOW the container limit, so Redis evicts keys
+    # itself instead of being OOMKilled by the kernel. Without this, Redis
+    # grows until the container is killed and you lose everything at once.
+    maxmemory 192mb
+    # allkeys-lru: evict the least recently used key of any kind when full.
+    # Sessions are evictable too - so under memory pressure users get logged
+    # out. Watch `redis_evicted_keys` if logins start failing mysteriously.
+    maxmemory-policy allkeys-lru
+
+    # Disable the RDB snapshotting that the default config enables, since the
+    # AOF already covers durability and forking to snapshot doubles memory.
+    save ""
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: l2lab
+  labels: { app: redis }
+spec:
+  selector: { app: redis }
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: l2lab
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 999      # `redis` in the official Alpine image
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["redis-server", "/etc/redis/redis.conf"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: config
+              mountPath: /etc/redis
+            - name: data
+              mountPath: /data
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            # 256Mi limit against a 192mb maxmemory leaves headroom for Redis's
+            # own overhead (client buffers, AOF rewrite).
+            limits: { memory: 256Mi }
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 10
+          livenessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+
+        # --- metrics sidecar ------------------------------------------------
+        - name: exporter
+          image: oliver006/redis_exporter:v1.83.0
+          args:
+            - --redis.addr=redis://127.0.0.1:6379
+            - --web.listen-address=:9121
+            # Count keys per PATTERN, not just in total. This is what makes
+            # "everyone got logged out" visible: sessions and cached timelines
+            # are separate series, so you can see WHICH kind of key the
+            # allkeys-lru policy evicted rather than guessing.
+            #
+            # Uses SCAN (not KEYS), so it does not block the server.
+            # NOTE: the flag is -check-keys, NOT -check-key-patterns. This
+            # exporter uses Go's stdlib flag package, which REJECTS unknown
+            # flags by printing usage and exiting non-zero - so a typo here
+            # crash-loops the sidecar and, because it shares the pod, takes
+            # Redis readiness with it.
+            - --check-keys=session:*,timeline:*
+            - --count-keys=session:*,timeline:*
+            # Per-command call counts and latency from INFO commandstats.
+            - --include-system-metrics
+          ports:
+            - name: metrics
+              containerPort: 9121
+          resources:
+            requests: { cpu: 10m, memory: 24Mi }
+            limits: { memory: 64Mi }
+          # No readinessProbe, for the same reason as the Postgres exporter:
+          # a broken metrics sidecar must not make Redis itself unreachable.
+          securityContext:
+            runAsUser: 59000
+            runAsGroup: 59000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: redis-config }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests: { storage: 2Gi }

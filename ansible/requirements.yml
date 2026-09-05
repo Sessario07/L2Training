@@ -1,0 +1,18 @@
+---
+# Install with:  ansible-galaxy collection install -r requirements.yml
+#
+# The Python side matters too. These collections talk to APIs, so the
+# interpreter running Ansible needs `kubernetes` and `boto3` — not the system
+# python, but whichever interpreter `ansible --version` reports:
+#
+#   ansible --version | grep 'python version'
+#   <that-python> -m pip install kubernetes boto3
+collections:
+  - name: kubernetes.core     # k8s, k8s_info, k8s_exec, k8s_scale, k8s_drain
+    version: ">=5.0.0"
+  - name: amazon.aws          # AWS modules and lookups
+    version: ">=8.0.0"
+  - name: community.general   # random_string lookup, misc helpers
+    version: ">=9.0.0"
+  - name: ansible.posix       # profile_tasks callback (task timings)
+    version: ">=1.5.0"

@@ -1,0 +1,327 @@
+---
+# Executable version of docs/RUNBOOK.md Part 1.
+#
+#   ansible-playbook verify.yml
+#
+# Every check below is one you would otherwise run by hand and eyeball. Making
+# them assertions means the answer is pass/fail rather than "that output looks
+# about right", and it means you can re-run the whole set in thirty seconds
+# after making a change.
+#
+# This is deliberately NOT the same as the Prometheus alerts. Alerts watch a
+# running system; this proves a freshly-built one is actually correct.
+
+- name: Verify the l2lab environment
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    failures: []
+
+  tasks:
+
+    # ------------------------------------------------------------- 1. nodes
+    - name: Get nodes
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: nodes
+
+    - name: All nodes are Ready
+      ansible.builtin.assert:
+        that:
+          - nodes.resources | length >= 2
+          - nodes.resources | selectattr('status.conditions', 'defined')
+              | map(attribute='status.conditions') | flatten
+              | selectattr('type', 'eq', 'Ready')
+              | selectattr('status', 'eq', 'True') | list | length
+            == nodes.resources | length
+        fail_msg: >-
+          Expected >=2 Ready nodes, found {{ nodes.resources | length }}.
+          Spot capacity may be unavailable - check:
+          aws eks describe-nodegroup --cluster-name {{ project }}
+          --nodegroup-name {{ nodegroup }}
+        success_msg: "{{ nodes.resources | length }} nodes Ready"
+
+    - name: Nodes are spread across at least two availability zones
+      ansible.builtin.assert:
+        that: >-
+          nodes.resources
+          | map(attribute='metadata.labels["topology.kubernetes.io/zone"]')
+          | unique | length >= 2
+        fail_msg: "All nodes are in one AZ - losing it takes the cluster down"
+        success_msg: >-
+          Zones: {{ nodes.resources
+            | map(attribute='metadata.labels["topology.kubernetes.io/zone"]')
+            | unique | join(', ') }}
+
+    # ------------------------------------------------------------- 2. addons
+    - name: Get kube-system pods
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ ns_sys }}"
+      register: sys_pods
+
+    - name: Required platform components are present and running
+      ansible.builtin.assert:
+        that: >-
+          sys_pods.resources
+          | selectattr('metadata.name', 'search', item)
+          | selectattr('status.phase', 'eq', 'Running')
+          | list | length > 0
+        fail_msg: "No Running pod matching '{{ item }}' in {{ ns_sys }}"
+        success_msg: "{{ item }}: running"
+      loop:
+        - coredns
+        - aws-node
+        - kube-proxy
+        - ebs-csi-controller
+        - metrics-server
+        - aws-load-balancer-controller
+        - external-dns
+        - secrets-store
+
+    # --------------------------------------------------------- 3. no crashes
+    - name: Get all pods in our namespaces
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ item }}"
+      register: ns_pods
+      loop: ["{{ ns_app }}", "{{ ns_obs }}"]
+
+    - name: No pod is crash-looping
+      ansible.builtin.assert:
+        that: >-
+          ns_pods.results | map(attribute='resources') | flatten
+          | map(attribute='status.containerStatuses', 'default', [])
+          | flatten | map(attribute='restartCount') | sum < 5
+        fail_msg: >-
+          Containers are restarting. Investigate with:
+          kubectl get pods -A --sort-by=.status.containerStatuses[0].restartCount
+        success_msg: "No significant restarts"
+
+    - name: Every pod is Running or Succeeded
+      ansible.builtin.assert:
+        that: >-
+          ns_pods.results | map(attribute='resources') | flatten
+          | rejectattr('status.phase', 'in', ['Running', 'Succeeded'])
+          | list | length == 0
+        fail_msg: >-
+          Not-running pods:
+          {{ ns_pods.results | map(attribute='resources') | flatten
+             | rejectattr('status.phase', 'in', ['Running','Succeeded'])
+             | map(attribute='metadata.name') | join(', ') }}
+        success_msg: "All pods Running"
+
+    # ------------------------------------------------------------ 4. storage
+    - name: Get PVCs
+      kubernetes.core.k8s_info:
+        kind: PersistentVolumeClaim
+      register: pvcs
+
+    - name: Every PVC is Bound
+      ansible.builtin.assert:
+        that: >-
+          pvcs.resources | rejectattr('status.phase', 'eq', 'Bound')
+          | list | length == 0
+        fail_msg: >-
+          Unbound PVCs:
+          {{ pvcs.resources | rejectattr('status.phase','eq','Bound')
+             | map(attribute='metadata.name') | join(', ') }}
+          - usually the EBS CSI driver's IRSA role.
+        success_msg: "{{ pvcs.resources | length }} PVCs Bound"
+
+    # ------------------------------------------------------------ 5. secrets
+    - name: The Postgres secret mounted from Secrets Manager is readable
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_app }}"
+        pod: postgres-0
+        command: sh -c "test -s /mnt/secrets/postgres-password && echo MOUNTED"
+      register: secret_mount
+      failed_when: "'MOUNTED' not in secret_mount.stdout"
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "Secrets Store CSI mount is working - no plaintext secrets in the repo"
+
+    # --------------------------------------------------- 6. data layer alive
+    - name: Postgres accepts connections
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_app }}"
+        pod: postgres-0
+        command: pg_isready -U l2lab -d l2lab
+      register: pg
+      failed_when: "'accepting connections' not in pg.stdout"
+      changed_when: false
+
+    - name: Redis answers PING
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_app }}"
+        pod: redis-0
+        command: redis-cli ping
+      register: redis
+      failed_when: "'PONG' not in redis.stdout"
+      changed_when: false
+
+    - name: The schema was migrated
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_app }}"
+        pod: postgres-0
+        command: >-
+          psql -U l2lab -d l2lab -tAc
+          "select count(*) from information_schema.tables
+           where table_schema='public'
+             and table_name in ('users','posts','follows','likes')"
+      register: tables
+      failed_when: tables.stdout | trim != "4"
+      changed_when: false
+
+    - name: Report data layer
+      ansible.builtin.debug:
+        msg: "Postgres ready, Redis ready, all 4 tables present"
+
+    # ---------------------------------------------------------- 7. the app
+    - name: The application reports itself ready
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_obs }}"
+        pod: "{{ (lookup('kubernetes.core.k8s', kind='Pod', namespace=ns_obs,
+                  label_selector='app=prometheus'))[0].metadata.name }}"
+        command: >-
+          wget -qO- --timeout=5
+          http://app.{{ ns_app }}.svc.cluster.local/readyz
+      register: readyz
+      changed_when: false
+
+    - name: readyz reports every dependency healthy
+      ansible.builtin.assert:
+        that:
+          - (readyz.stdout | from_json).ready
+          - (readyz.stdout | from_json).checks.postgres == "ok"
+          - (readyz.stdout | from_json).checks.redis == "ok"
+        fail_msg: "readyz says: {{ readyz.stdout }}"
+        success_msg: "Application ready: {{ readyz.stdout }}"
+
+    # ------------------------------------------------------- 8. ALB and DNS
+    - name: Get ingresses
+      kubernetes.core.k8s_info:
+        kind: Ingress
+      register: ingresses
+
+    - name: All three ingresses share ONE load balancer
+      ansible.builtin.assert:
+        that:
+          - ingresses.resources | length == 3
+          - ingresses.resources
+              | map(attribute='status.loadBalancer.ingress') | flatten
+              | map(attribute='hostname') | unique | length == 1
+        fail_msg: >-
+          Expected 3 ingresses (api, frontend, grafana) sharing 1 ALB. Addresses:
+          {{ ingresses.resources | map(attribute='status.loadBalancer.ingress')
+             | flatten | map(attribute='hostname', default='<none>') | list }}
+          If empty, check:
+          kubectl logs -n kube-system deploy/aws-load-balancer-controller
+        success_msg: >-
+          One shared ALB:
+          {{ (ingresses.resources[0].status.loadBalancer.ingress[0].hostname) }}
+
+    - name: DNS resolves for both hostnames
+      ansible.builtin.command: "dig +short {{ item }}"
+      register: dns
+      changed_when: false
+      failed_when: dns.stdout | trim == ""
+      retries: 12
+      delay: 10
+      until: dns.stdout | trim != ""
+      loop: ["{{ app_host }}", "{{ grafana_host }}"]
+
+    - name: The app answers over HTTPS
+      ansible.builtin.uri:
+        url: "https://{{ app_host }}/healthz"
+        return_content: true
+      register: https_check
+      retries: 10
+      delay: 15
+      until: https_check.status is defined and https_check.status == 200
+
+    - name: Grafana answers over HTTPS
+      ansible.builtin.uri:
+        url: "https://{{ grafana_host }}/api/health"
+        return_content: true
+      register: grafana_check
+      retries: 10
+      delay: 15
+      until: grafana_check.status is defined and grafana_check.status == 200
+
+    # -------------------------------------------------- 9. observability
+    - name: Prometheus has healthy scrape targets
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_obs }}"
+        pod: prometheus-0
+        command: >-
+          wget -qO- --timeout=10
+          "http://localhost:9090/api/v1/targets?state=active"
+      register: targets
+      changed_when: false
+
+    - name: The application is actually being scraped
+      ansible.builtin.assert:
+        that: >-
+          (targets.stdout | from_json).data.activeTargets
+          | selectattr('labels.namespace', 'defined')
+          | selectattr('labels.namespace', 'eq', ns_app)
+          | selectattr('health', 'eq', 'up') | list | length >= 2
+        fail_msg: >-
+          Application pods are not being scraped. Check the
+          prometheus.io/scrape annotations on the app Deployment.
+        success_msg: >-
+          {{ (targets.stdout | from_json).data.activeTargets
+             | selectattr('health','eq','up') | list | length }}
+          healthy scrape targets
+
+    - name: Application metrics have actually arrived
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_obs }}"
+        pod: prometheus-0
+        command: >-
+          wget -qO- --timeout=10
+          "http://localhost:9090/api/v1/query?query=app_http_requests_total"
+      register: metric
+      changed_when: false
+      failed_when: (metric.stdout | from_json).data.result | length == 0
+
+    - name: Loki is ready
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_obs }}"
+        pod: loki-0
+        command: wget -qO- --timeout=5 http://localhost:3100/ready
+      register: loki
+      changed_when: false
+      failed_when: "'ready' not in loki.stdout"
+
+    - name: Tempo is ready
+      kubernetes.core.k8s_exec:
+        namespace: "{{ ns_obs }}"
+        pod: tempo-0
+        command: wget -qO- --timeout=5 http://localhost:3200/ready
+      register: tempo
+      changed_when: false
+      failed_when: tempo.rc != 0
+
+    # ------------------------------------------------------------- summary
+    - name: All checks passed
+      ansible.builtin.debug:
+        msg:
+          - "===================================================="
+          - " Environment verified."
+          - "===================================================="
+          - "  app     https://{{ app_host }}"
+          - "  grafana https://{{ grafana_host }}"
+          - ""
+          - " Now prove the observability CORRELATION works by hand -"
+          - " an assertion cannot check this, and it is the whole point:"
+          - "   1. Grafana -> Explore -> Loki: {namespace=\"l2lab\"}"
+          - "   2. Expand a log line, click 'View trace'"
+          - "   3. Confirm Tempo shows nested spans:"
+          - "      http -> redis.get_session -> postgres.timeline"
+          - "   4. Explore -> Tempo -> Service Graph should draw itself"
+          - "===================================================="

@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: l2lab
+
+resources:
+  - configmap.yaml
+  - api.yaml
+  - frontend.yaml
+  - worker.yaml
+  - ingress.yaml
+
+# `make deploy` runs `kustomize edit set image` against both of these,
+# substituting the ECR URLs and the immutable git-sha tag just pushed.
+images:
+  - name: l2lab-app
+    newName: 134604498185.dkr.ecr.ap-southeast-3.amazonaws.com/l2lab-sawibowo/api
+    newTag: 20260901-140429
+  - name: l2lab-frontend
+    newName: 134604498185.dkr.ecr.ap-southeast-3.amazonaws.com/l2lab-sawibowo/frontend
+    newTag: 20260901-140429

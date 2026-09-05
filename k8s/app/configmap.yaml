@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: l2lab
+data:
+  # Kubernetes DNS names. The fully-qualified form (.svc.cluster.local) skips
+  # the search-domain expansion that a short name triggers, so each lookup is
+  # one query instead of up to five. At high request rates that difference is
+  # enough to overload CoreDNS.
+  REDIS_ADDR: redis.l2lab.svc.cluster.local:6379
+  NATS_URL: nats://nats.l2lab.svc.cluster.local:4222
+
+  # Traces go straight to Tempo's OTLP HTTP receiver. In a bigger setup you
+  # would send them to a collector first, for sampling and enrichment.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo.observability.svc.cluster.local:4318
+
+  MIGRATIONS_DIR: /migrations
+  LOG_LEVEL: info
+  APP_ENV: lab

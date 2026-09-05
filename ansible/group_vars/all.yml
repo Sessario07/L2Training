@@ -1,0 +1,39 @@
+---
+# Single source of truth for the playbooks. These must agree with
+# terraform/variables.tf — if you change `name` there, change it here.
+
+project:      l2lab-sawibowo
+aws_region:   ap-southeast-3
+aws_account:  "134604498185"
+
+domain:       sawibowo.sandbox.devopsinstitute.id
+app_host:     "app.{{ domain }}"
+grafana_host: "grafana.{{ domain }}"
+
+# Paths, resolved relative to the ansible/ directory.
+repo_root:    "{{ playbook_dir }}/.."
+terraform_dir: "{{ repo_root }}/terraform"
+k8s_dir:       "{{ repo_root }}/k8s"
+app_dir:       "{{ repo_root }}/app"
+
+# Namespaces
+ns_app:   l2lab
+ns_obs:   observability
+ns_sys:   kube-system
+
+# Node group scaling, used by ops/scale.yml
+nodegroup:      "{{ project }}-ng"
+node_min:       2
+node_max:       3
+node_desired:   2
+
+# Secrets Manager secret ids
+secret_postgres: "{{ project }}/postgres"
+secret_grafana:  "{{ project }}/grafana"
+
+backup_bucket: "{{ project }}-backups-{{ aws_account }}"
+
+# How long to wait for slow things (EKS, rollouts) before failing.
+timeouts:
+  rollout: 300
+  cluster: 1800

@@ -1,0 +1,28 @@
+# The controller needs to know which cluster it serves, so it can find the
+# right subnets (by the kubernetes.io/cluster/<name> tag) and name the load
+# balancers it creates. The upstream manifest leaves this as a placeholder.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aws-load-balancer-controller
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          args:
+            - --cluster-name=l2lab-sawibowo
+            - --ingress-class=alb
+            # BOTH of these must be explicit. Without --aws-vpc-id the
+            # controller tries to discover the VPC from EC2 instance metadata
+            # and crash-loops with:
+            #   "failed to get VPC ID ... context deadline exceeded"
+            # IMDS is reachable from pods here (the launch template sets
+            # http_put_response_hop_limit = 2), but relying on it is fragile
+            # and pointless when we already know the answer.
+            - --aws-region=ap-southeast-3
+            - --aws-vpc-id=vpc-07645fc7d2b56451b
+            - --enable-shield=false
+            - --enable-waf=false
+            - --enable-wafv2=false

@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+  namespace: observability
+data:
+  tempo.yaml: |
+    server:
+      http_listen_port: 3200
+      log_level: info
+
+    distributor:
+      receivers:
+        # OTLP is the vendor-neutral wire format the application speaks.
+        # Both transports are enabled: the Go SDK here uses HTTP (4318),
+        # Alloy forwards over gRPC (4317).
+        otlp:
+          protocols:
+            http:
+              endpoint: 0.0.0.0:4318
+            grpc:
+              endpoint: 0.0.0.0:4317
+
+    ingester:
+      # Flush blocks quickly so traces become searchable within a minute.
+      # The default is 30m, which feels broken when you are learning.
+      max_block_duration: 5m
+
+    compactor:
+      compaction:
+        block_retention: 24h
+
+    storage:
+      trace:
+        backend: local
+        local:
+          path: /var/tempo/blocks
+        wal:
+          path: /var/tempo/wal
+
+    # The metrics-generator derives RED metrics and a service graph from the
+    # traces themselves, then remote-writes them to Prometheus. This is what
+    # produces the automatic service topology map in Grafana - you get it for
+    # free, without instrumenting anything extra.
+    metrics_generator:
+      registry:
+        external_labels:
+          source: tempo
+          cluster: l2lab-sawibowo
+      storage:
+        path: /var/tempo/generator/wal
+        remote_write:
+          - url: http://prometheus.observability.svc.cluster.local:9090/api/v1/write
+            send_exemplars: true
+      traces_storage:
+        path: /var/tempo/generator/traces
+      processor:
+        local_blocks:
+          flush_to_storage: true
+
+    overrides:
+      defaults:
+        metrics_generator:
+          processors:
+            - service-graphs      # who calls whom, and how often it fails
+            - span-metrics        # RED metrics derived from spans
+            - local-blocks
+
+    usage_report:
+      reporting_enabled: false

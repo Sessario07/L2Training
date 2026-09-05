@@ -1,0 +1,20 @@
+# The upstream manifest bundle does NOT include an IngressClass — the Helm
+# chart creates it, and the pre-rendered YAML does not. Without this, every
+# Ingress is rejected by the controller's own admission webhook with:
+#
+#   admission webhook "vingress.elbv2.k8s.aws" denied the request:
+#   invalid ingress class: IngressClass.networking.k8s.io "alb" not found
+#
+# which is confusing, because the error names a resource you never knew you
+# were supposed to create.
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: alb
+  annotations:
+    # Not the cluster default on purpose. An Ingress must opt in with
+    # `ingressClassName: alb`, so a stray Ingress in some other namespace
+    # cannot accidentally provision a billable load balancer.
+    ingressclass.kubernetes.io/is-default-class: "false"
+spec:
+  controller: ingress.k8s.aws/alb

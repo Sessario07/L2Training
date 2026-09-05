@@ -1,0 +1,9 @@
+# There are no servers to SSH into. Every task here talks to the AWS API or
+# the Kubernetes API from this machine, so the inventory is a single implicit
+# localhost. That is normal for cloud-native Ansible and worth understanding:
+# Ansible is being used as an orchestrator, not a configuration-management
+# agent pushing files onto hosts.
+all:
+  hosts:
+    localhost:
+      ansible_connection: local

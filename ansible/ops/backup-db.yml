@@ -1,0 +1,76 @@
+---
+# Trigger a database backup immediately, rather than waiting for the CronJob.
+#
+#   ansible-playbook ops/backup-db.yml
+#
+# Run this before any risky change. It is also how you verify the CronJob's
+# machinery works without waiting until 02:00 to find out it does not.
+
+- name: Back up PostgreSQL now
+  hosts: localhost
+  gather_facts: true
+
+  vars:
+    job_name: "manual-backup-{{ ansible_date_time.epoch }}"
+
+  tasks:
+    - name: Confirm the CronJob exists
+      kubernetes.core.k8s_info:
+        kind: CronJob
+        namespace: "{{ ns_app }}"
+        name: postgres-backup
+      register: cj
+      failed_when: cj.resources | length == 0
+
+    - name: Create a Job from the CronJob template
+      # `kubectl create job --from=cronjob/...` reuses the exact pod spec, so
+      # this tests the real thing rather than an approximation of it.
+      ansible.builtin.command: >-
+        kubectl create job -n {{ ns_app }} {{ job_name }}
+        --from=cronjob/postgres-backup
+      changed_when: true
+
+    - name: Wait for it to finish
+      ansible.builtin.command: >-
+        kubectl wait -n {{ ns_app }} --for=condition=complete
+        --timeout=600s job/{{ job_name }}
+      register: waited
+      changed_when: false
+      failed_when: false
+
+    - name: Fetch the job's logs either way
+      ansible.builtin.command: >-
+        kubectl logs -n {{ ns_app }} job/{{ job_name }} --all-containers
+      register: joblog
+      changed_when: false
+      failed_when: false
+
+    - name: Show the logs
+      ansible.builtin.debug:
+        var: joblog.stdout_lines
+
+    - name: Fail loudly if the backup did not complete
+      ansible.builtin.assert:
+        that: waited.rc == 0
+        fail_msg: >-
+          Backup job did not complete. Logs above. Common causes: the IRSA role
+          on the `backup` ServiceAccount, or the S3 bucket name in the CronJob
+          not matching terraform's output.
+        success_msg: "Backup completed"
+
+    - name: List what is now in the bucket
+      ansible.builtin.command: >-
+        aws s3 ls s3://{{ backup_bucket }}/postgres/ --human-readable
+      register: listing
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ listing.stdout_lines }}"
+
+    - name: Clean up the manual job
+      kubernetes.core.k8s:
+        state: absent
+        kind: Job
+        namespace: "{{ ns_app }}"
+        name: "{{ job_name }}"

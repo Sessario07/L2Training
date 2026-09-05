@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>l2lab</title>
+<!-- Inline SVG favicon. Without one the browser requests /favicon.ico on every
+     load and gets a 404, which becomes pure noise in the Loki logs. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234d8dff'/%3E%3Ctext x='16' y='22' font-family='system-ui,sans-serif' font-size='15' font-weight='700' fill='%23fff' text-anchor='middle'%3El2%3C/text%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#12161f; --panel2:#171c28; --line:#232a38;
+    --fg:#e7ebf0; --muted:#7c8798; --accent:#4d8dff; --accent-dim:#2b4d8f;
+    --like:#f4436c; --ok:#3ecf8e; --warn:#f5a524; --danger:#f4436c;
+    --r:12px;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--bg); color:var(--fg);
+    font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--accent); text-decoration:none}
+  button{font:inherit; cursor:pointer; border:0; background:none; color:inherit}
+  input,textarea{font:inherit; color:var(--fg); background:#080b10;
+    border:1px solid var(--line); border-radius:8px; padding:10px 12px; width:100%}
+  input:focus,textarea:focus{outline:none; border-color:var(--accent-dim)}
+  textarea{resize:vertical}
+  ::placeholder{color:#5b6577}
+
+  /* ---------- buttons ---------- */
+  .btn{background:var(--accent); color:#fff; border-radius:999px;
+       padding:8px 18px; font-weight:600; font-size:14px; transition:filter .15s}
+  .btn:hover:not(:disabled){filter:brightness(1.12)}
+  .btn:disabled{opacity:.45; cursor:not-allowed}
+  .btn.ghost{background:transparent; border:1px solid var(--line); color:var(--fg)}
+  .btn.ghost:hover{background:var(--panel2)}
+  .btn.sm{padding:5px 14px; font-size:13px}
+  .btn.following{background:transparent; border:1px solid var(--line)}
+  .btn.following:hover{border-color:var(--danger); color:var(--danger)}
+  .btn.following:hover .f-on{display:none}
+  .btn.following:hover .f-off{display:inline}
+  .f-off{display:none}
+
+  /* ---------- layout ---------- */
+  .shell{display:grid; grid-template-columns:220px minmax(0,600px); gap:24px;
+         max-width:860px; margin:0 auto; padding:0 16px}
+  nav{position:sticky; top:0; height:100vh; padding:20px 0;
+      display:flex; flex-direction:column; gap:4px}
+  .brand{font-size:20px; font-weight:700; letter-spacing:-.02em; padding:6px 12px 18px}
+  .brand span{color:var(--accent)}
+  .navlink{display:flex; align-items:center; gap:12px; padding:10px 12px;
+           border-radius:999px; color:var(--muted); font-weight:500; transition:background .15s}
+  .navlink:hover{background:var(--panel2); color:var(--fg)}
+  .navlink.active{color:var(--fg); font-weight:700}
+  .navlink svg{width:20px; height:20px; flex:none}
+  .navfoot{margin-top:auto; padding:12px; border-top:1px solid var(--line)}
+  main{min-height:100vh; border-left:1px solid var(--line); border-right:1px solid var(--line)}
+  .head{position:sticky; top:0; z-index:5; background:rgba(11,14,20,.82);
+        backdrop-filter:blur(12px); border-bottom:1px solid var(--line);
+        padding:14px 18px; display:flex; align-items:center; gap:14px}
+  .head h2{font-size:18px; font-weight:700}
+  .head .sub{font-size:12px; color:var(--muted); font-weight:400}
+  .back{font-size:20px; color:var(--muted); line-height:1}
+  .back:hover{color:var(--fg)}
+
+  /* ---------- avatar ---------- */
+  .av{width:42px; height:42px; border-radius:50%; flex:none; display:grid;
+      place-items:center; font-weight:700; font-size:15px; color:#fff; user-select:none}
+  .av.sm{width:32px; height:32px; font-size:12px}
+  .av.lg{width:68px; height:68px; font-size:24px}
+
+  /* ---------- composer ---------- */
+  .composer{display:flex; gap:12px; padding:16px 18px; border-bottom:1px solid var(--line)}
+  .composer textarea{border:0; background:transparent; padding:8px 0; font-size:17px; min-height:52px}
+  .composer .row{display:flex; align-items:center; justify-content:space-between; margin-top:8px}
+  .counter{font-size:13px; color:var(--muted); font-variant-numeric:tabular-nums}
+  .counter.warn{color:var(--warn)} .counter.over{color:var(--danger)}
+
+  /* ---------- posts ---------- */
+  .post{display:flex; gap:12px; padding:14px 18px; border-bottom:1px solid var(--line);
+        cursor:pointer; transition:background .12s}
+  .post:hover{background:#0e1219}
+  .post.focus{cursor:default; padding-bottom:18px}
+  .post.focus:hover{background:none}
+  .pbody{min-width:0; flex:1}
+  .pmeta{display:flex; align-items:baseline; gap:6px; flex-wrap:wrap; font-size:14px}
+  .pname{font-weight:700}
+  .phandle,.ptime{color:var(--muted); font-size:14px}
+  .ptext{margin-top:2px; white-space:pre-wrap; word-wrap:break-word; overflow-wrap:anywhere}
+  .post.focus .ptext{font-size:20px; margin-top:10px; line-height:1.4}
+  .replyto{font-size:13px; color:var(--muted); margin-bottom:2px}
+  .actions{display:flex; gap:4px; margin-top:8px; margin-left:-8px}
+  .act{display:flex; align-items:center; gap:6px; padding:6px 8px; border-radius:999px;
+       color:var(--muted); font-size:13px; font-variant-numeric:tabular-nums; transition:.12s}
+  .act svg{width:17px; height:17px}
+  .act:hover{background:rgba(77,141,255,.12); color:var(--accent)}
+  .act.like:hover{background:rgba(244,67,108,.12); color:var(--like)}
+  .act.like.on{color:var(--like)}
+  .act.del:hover{background:rgba(244,67,108,.12); color:var(--danger)}
+
+  /* ---------- profile ---------- */
+  .banner{height:110px; background:linear-gradient(120deg,#1d2b4d,#3b2a52)}
+  .phead{padding:0 18px 16px; border-bottom:1px solid var(--line)}
+  .phead .top{display:flex; justify-content:space-between; align-items:flex-end; margin-top:-34px}
+  .phead .av{border:4px solid var(--bg)}
+  .phead h3{font-size:19px; font-weight:800; margin-top:12px}
+  .phead .at{color:var(--muted); font-size:14px}
+  .bio{margin-top:10px}
+  .stats{display:flex; gap:18px; margin-top:12px; font-size:14px}
+  .stats b{font-weight:700} .stats span{color:var(--muted)}
+
+  /* ---------- user rows ---------- */
+  .urow{display:flex; align-items:center; gap:12px; padding:12px 18px;
+        border-bottom:1px solid var(--line)}
+  .urow:hover{background:#0e1219}
+  .urow .u{flex:1; min-width:0; cursor:pointer}
+  .urow .n{font-weight:700; font-size:14px}
+  .urow .h{color:var(--muted); font-size:13px}
+
+  /* ---------- misc ---------- */
+  .empty{padding:48px 18px; text-align:center; color:var(--muted)}
+  .empty b{display:block; color:var(--fg); font-size:16px; margin-bottom:6px}
+  .spin{padding:40px; text-align:center; color:var(--muted); font-size:14px}
+  .tabs{display:flex; border-bottom:1px solid var(--line)}
+  .tab{flex:1; padding:14px; text-align:center; font-weight:600; color:var(--muted)}
+  .tab:hover{background:var(--panel2)} .tab.on{color:var(--fg); box-shadow:inset 0 -3px 0 var(--accent)}
+  .src{font-size:11px; color:var(--muted); text-transform:uppercase;
+       letter-spacing:.07em; padding:8px 18px; border-bottom:1px solid var(--line)}
+  .src b{color:var(--ok); font-weight:600}
+
+  /* ---------- toast ---------- */
+  #toast{position:fixed; left:50%; bottom:28px; transform:translateX(-50%) translateY(80px);
+         background:var(--accent); color:#fff; padding:11px 20px; border-radius:999px;
+         font-size:14px; font-weight:500; opacity:0; transition:.25s; z-index:50;
+         box-shadow:0 8px 28px rgba(0,0,0,.5); max-width:90vw}
+  #toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
+  #toast.err{background:var(--danger)}
+
+  /* ---------- auth ---------- */
+  .authwrap{min-height:100vh; display:grid; place-items:center; padding:20px}
+  .authcard{width:100%; max-width:380px; background:var(--panel);
+            border:1px solid var(--line); border-radius:16px; padding:30px}
+  .authcard h1{font-size:26px; font-weight:800; letter-spacing:-.02em}
+  .authcard h1 span{color:var(--accent)}
+  .authcard p.lede{color:var(--muted); font-size:14px; margin:6px 0 24px}
+  .field{margin-bottom:14px}
+  .field label{display:block; font-size:12px; color:var(--muted); margin-bottom:5px; font-weight:500}
+  .authcard .btn{width:100%; padding:11px; margin-top:6px}
+  .swap{text-align:center; margin-top:18px; font-size:14px; color:var(--muted)}
+  .swap button{color:var(--accent); font-weight:600}
+  .hint{margin-top:20px; padding-top:16px; border-top:1px solid var(--line);
+        font-size:12px; color:var(--muted); text-align:center}
+  .hint code{background:var(--panel2); padding:2px 6px; border-radius:4px; color:var(--fg)}
+
+  .hidden{display:none !important}
+
+  @media (max-width:720px){
+    .shell{grid-template-columns:1fr; gap:0}
+    nav{position:fixed; bottom:0; top:auto; left:0; right:0; height:auto;
+        flex-direction:row; justify-content:space-around; background:var(--panel);
+        border-top:1px solid var(--line); padding:8px; z-index:20}
+    .brand,.navfoot{display:none}
+    .navlink span{display:none}
+    main{border:0; padding-bottom:70px}
+  }
+</style>
+</head>
+<body>
+
+<!-- ===================== logged out ===================== -->
+<div id="auth" class="authwrap">
+  <div class="authcard">
+    <h1>l2<span>lab</span></h1>
+    <p class="lede" id="authLede">Sign in to continue.</p>
+    <form id="authForm">
+      <div class="field">
+        <label for="u">Username</label>
+        <input id="u" autocomplete="username" placeholder="3–32 characters" required>
+      </div>
+      <div class="field">
+        <label for="p">Password</label>
+        <input id="p" type="password" autocomplete="current-password"
+               placeholder="at least 8 characters" required>
+      </div>
+      <button class="btn" id="authBtn" type="submit">Log in</button>
+    </form>
+    <div class="swap">
+      <span id="swapText">No account?</span>
+      <button id="swapBtn" type="button">Sign up</button>
+    </div>
+    <div class="hint">
+      Seeded demo accounts: <code>alice</code> · <code>bob</code> · <code>carol</code><br>
+      password <code>password123</code>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== logged in ===================== -->
+<div id="app" class="shell hidden">
+  <nav>
+    <div class="brand">l2<span>lab</span></div>
+    <a class="navlink" href="#/home" data-nav="home">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>
+      <span>Home</span>
+    </a>
+    <a class="navlink" href="#/explore" data-nav="explore">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      <span>Explore</span>
+    </a>
+    <a class="navlink" href="#/me" data-nav="me">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+      <span>Profile</span>
+    </a>
+    <div class="navfoot">
+      <div style="display:flex; align-items:center; gap:10px">
+        <div class="av sm" id="navAv"></div>
+        <div style="flex:1; min-width:0">
+          <div style="font-weight:700; font-size:13px" id="navName"></div>
+          <div style="color:var(--muted); font-size:12px" id="navHandle"></div>
+        </div>
+      </div>
+      <button class="btn ghost sm" style="width:100%; margin-top:10px" id="logout">Log out</button>
+    </div>
+  </nav>
+  <main id="view"></main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Small helpers
+ * ------------------------------------------------------------------ */
+const $ = id => document.getElementById(id);
+
+// Build an element. Text always goes in via textContent, never innerHTML —
+// user-authored post bodies must never be parsed as markup.
+function el(tag, attrs, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") n.className = v;
+    else if (k === "text") n.textContent = v;
+    else if (k === "html") n.innerHTML = v;             // only ever our own SVG
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid === null || kid === undefined || kid === false) continue;
+    n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return n;
+}
+
+let toastTimer;
+function toast(msg, isErr) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "show" + (isErr ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.className = ""), 3200);
+}
+
+async function api(path, method = "GET", body) {
+  const res = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 204) return {};
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function when(ts) {
+  const s = Math.floor((Date.now() - new Date(ts)) / 1000);
+  if (s < 5) return "now";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  if (s < 604800) return Math.floor(s / 86400) + "d";
+  return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+// Deterministic avatar colour from the username, so a person looks the same
+// everywhere without storing an image anywhere.
+function avatar(name, size) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+  const n = el("div", { class: "av" + (size ? " " + size : ""), text: name.slice(0, 2).toUpperCase() });
+  n.style.background = `linear-gradient(135deg, hsl(${h} 62% 46%), hsl(${(h + 42) % 360} 62% 38%))`;
+  return n;
+}
+
+const ICON = {
+  reply: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.1A8.4 8.4 0 0 1 12 3a8.4 8.4 0 0 1 9 8.5z"/></svg>',
+  heart: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>',
+  heartOn: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>',
+};
+
+/* ------------------------------------------------------------------ *
+ * State
+ * ------------------------------------------------------------------ */
+let me = null;
+
+/* ------------------------------------------------------------------ *
+ * Components
+ * ------------------------------------------------------------------ */
+
+function composer({ parentId = null, placeholder = "What's happening?", onDone }) {
+  const ta = el("textarea", { maxlength: "280", placeholder, rows: "1" });
+  const count = el("div", { class: "counter", text: "280" });
+  const btn = el("button", { class: "btn", disabled: true, text: parentId ? "Reply" : "Post" });
+
+  const sync = () => {
+    const left = 280 - ta.value.length;
+    count.textContent = String(left);
+    count.className = "counter" + (left < 0 ? " over" : left <= 20 ? " warn" : "");
+    btn.disabled = ta.value.trim().length === 0 || left < 0;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 240) + "px";
+  };
+  ta.addEventListener("input", sync);
+
+  const submit = async () => {
+    const body = ta.value.trim();
+    if (!body) return;
+    btn.disabled = true;
+    try {
+      await api("/api/posts", "POST", parentId ? { body, parent_id: parentId } : { body });
+      ta.value = ""; sync();
+      toast(parentId ? "Reply posted" : "Posted");
+      onDone && onDone();
+    } catch (e) {
+      toast(e.message, true);
+      btn.disabled = false;
+    }
+  };
+  btn.addEventListener("click", submit);
+  // Cmd/Ctrl+Enter to send, the convention everywhere else.
+  ta.addEventListener("keydown", e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") submit();
+  });
+
+  return el("div", { class: "composer" },
+    avatar(me.username),
+    el("div", { style: "flex:1; min-width:0" },
+      ta,
+      el("div", { class: "row" }, count, btn)));
+}
+
+function postCard(p, { focus = false, onChange } = {}) {
+  const go = e => {
+    if (e.target.closest(".act")) return;      // clicks on buttons are not navigation
+    location.hash = "#/post/" + p.id;
+  };
+
+  const likeBtn = el("button", {
+    class: "act like" + (p.liked_by_me ? " on" : ""),
+    title: p.liked_by_me ? "Unlike" : "Like",
+    onclick: async () => {
+      try {
+        const updated = await api(`/api/posts/${p.id}/like`, p.liked_by_me ? "DELETE" : "PUT");
+        Object.assign(p, updated);
+        likeBtn.className = "act like" + (p.liked_by_me ? " on" : "");
+        likeBtn.innerHTML = (p.liked_by_me ? ICON.heartOn : ICON.heart) +
+          `<span>${p.likes || ""}</span>`;
+      } catch (e) { toast(e.message, true); }
+    },
+  });
+  likeBtn.innerHTML = (p.liked_by_me ? ICON.heartOn : ICON.heart) + `<span>${p.likes || ""}</span>`;
+
+  const replyBtn = el("button", {
+    class: "act", title: "Reply",
+    onclick: () => (location.hash = "#/post/" + p.id),
+  });
+  replyBtn.innerHTML = ICON.reply + `<span>${p.replies || ""}</span>`;
+
+  const acts = [replyBtn, likeBtn];
+  if (p.author_id === me.id) {
+    const del = el("button", { class: "act del", title: "Delete",
+      onclick: async () => {
+        if (!confirm("Delete this post?")) return;
+        try {
+          await api(`/api/posts/${p.id}`, "DELETE");
+          toast("Deleted");
+          onChange ? onChange() : route();
+        } catch (e) { toast(e.message, true); }
+      } });
+    del.innerHTML = ICON.trash;
+    acts.push(del);
+  }
+
+  const name = el("a", { class: "pname", href: "#/u/" + p.author, text: p.display_name || p.author });
+
+  return el("article", { class: "post" + (focus ? " focus" : ""), onclick: focus ? null : go },
+    avatar(p.author),
+    el("div", { class: "pbody" },
+      p.parent_id && !focus ? el("div", { class: "replyto", text: "· replying to a post" }) : null,
+      el("div", { class: "pmeta" },
+        name,
+        el("span", { class: "phandle", text: "@" + p.author }),
+        el("span", { class: "ptime", text: "· " + when(p.created_at) })),
+      el("div", { class: "ptext", text: p.body }),
+      el("div", { class: "actions" }, acts)));
+}
+
+function userRow(u, onChange) {
+  const btn = followButton(u, onChange);
+  return el("div", { class: "urow" },
+    avatar(u.username),
+    el("div", { class: "u", onclick: () => (location.hash = "#/u/" + u.username) },
+      el("div", { class: "n", text: u.display_name || u.username }),
+      el("div", { class: "h", text: "@" + u.username +
+        (u.followers ? ` · ${u.followers} follower${u.followers === 1 ? "" : "s"}` : "") }),
+      u.bio ? el("div", { class: "h", style: "margin-top:2px", text: u.bio }) : null),
+    u.is_self ? el("span", { class: "h", text: "you" }) : btn);
+}
+
+function followButton(u, onChange) {
+  const b = el("button", { class: "btn sm" + (u.is_following ? " following" : "") });
+  const paint = () => {
+    b.className = "btn sm" + (u.is_following ? " following" : "");
+    b.replaceChildren(u.is_following
+      ? el("span", {}, el("span", { class: "f-on", text: "Following" }),
+                        el("span", { class: "f-off", text: "Unfollow" }))
+      : document.createTextNode("Follow"));
+  };
+  paint();
+  b.addEventListener("click", async ev => {
+    ev.stopPropagation();
+    b.disabled = true;
+    try {
+      await api("/api/follow/" + encodeURIComponent(u.username),
+                u.is_following ? "DELETE" : "POST");
+      u.is_following = !u.is_following;
+      u.followers += u.is_following ? 1 : -1;
+      paint();
+      toast(u.is_following ? "Following @" + u.username : "Unfollowed @" + u.username);
+      onChange && onChange();
+    } catch (e) { toast(e.message, true); }
+    b.disabled = false;
+  });
+  return b;
+}
+
+function header(title, sub, back) {
+  return el("div", { class: "head" },
+    back ? el("button", { class: "back", text: "←", onclick: () => history.back() }) : null,
+    el("div", {}, el("h2", { text: title }), sub ? el("div", { class: "sub", text: sub }) : null));
+}
+
+function empty(title, msg) {
+  return el("div", { class: "empty" }, el("b", { text: title }), el("div", { text: msg }));
+}
+
+/* ------------------------------------------------------------------ *
+ * Views
+ * ------------------------------------------------------------------ */
+const view = () => $("view");
+const loading = () => view().replaceChildren(el("div", { class: "spin", text: "Loading…" }));
+
+async function viewHome() {
+  loading();
+  const d = await api("/api/timeline");
+  const feed = el("div", {});
+  // `source` comes straight from the API. Post something, refresh twice, and
+  // you can watch the read-through cache actually working.
+  const src = el("div", { class: "src" }, "served from ", el("b", { text: d.source }));
+  view().replaceChildren(
+    header("Home", null, false),
+    composer({ onDone: viewHome }),
+    src,
+    feed);
+  if (!d.posts || d.posts.length === 0) {
+    feed.append(empty("Your timeline is empty",
+      "Post something, or find people to follow under Explore."));
+  } else {
+    feed.append(...d.posts.map(p => postCard(p, { onChange: viewHome })));
+  }
+}
+
+async function viewExplore() {
+  loading();
+  const d = await api("/api/users");
+  const list = el("div", {});
+  view().replaceChildren(header("Explore", "People you might follow"), list);
+  if (!d.users || d.users.length === 0) {
+    list.append(empty("Nobody here yet", "You are the only account so far."));
+  } else {
+    list.append(...d.users.map(u => userRow(u)));
+  }
+}
+
+async function viewProfile(username) {
+  loading();
+  let d;
+  try {
+    d = await api("/api/users/" + encodeURIComponent(username));
+  } catch (e) {
+    view().replaceChildren(header("Not found", null, true), empty("No such user", e.message));
+    return;
+  }
+  const u = d.user;
+
+  const actions = u.is_self
+    ? el("button", { class: "btn ghost sm", text: "Edit profile", onclick: editProfile })
+    : followButton(u, () => {});
+
+  const stats = el("div", { class: "stats" },
+    el("div", {}, el("b", { text: String(u.posts) }), " ",
+      el("span", { text: u.posts === 1 ? "post" : "posts" })),
+    el("div", {}, el("b", { text: String(u.following) }), " ", el("span", { text: "following" })),
+    el("div", {}, el("b", { text: String(u.followers) }), " ",
+      el("span", { text: u.followers === 1 ? "follower" : "followers" })));
+
+  const posts = el("div", {});
+  view().replaceChildren(
+    header(u.display_name || u.username, `${u.posts} post${u.posts === 1 ? "" : "s"}`, true),
+    el("div", { class: "banner" }),
+    el("div", { class: "phead" },
+      el("div", { class: "top" }, avatar(u.username, "lg"), actions),
+      el("h3", { text: u.display_name || u.username }),
+      el("div", { class: "at", text: "@" + u.username }),
+      u.bio ? el("div", { class: "bio", text: u.bio }) : null,
+      stats),
+    posts);
+
+  if (!d.posts || d.posts.length === 0) {
+    posts.append(empty("No posts yet", "@" + u.username + " has not posted anything."));
+  } else {
+    posts.append(...d.posts.map(p => postCard(p, { onChange: () => viewProfile(username) })));
+  }
+}
+
+async function viewThread(id) {
+  loading();
+  let d;
+  try {
+    d = await api("/api/posts/" + encodeURIComponent(id));
+  } catch (e) {
+    view().replaceChildren(header("Not found", null, true), empty("No such post", e.message));
+    return;
+  }
+  const replies = el("div", {});
+  view().replaceChildren(
+    header("Post", null, true),
+    postCard(d.post, { focus: true, onChange: () => (location.hash = "#/home") }),
+    composer({ parentId: d.post.id, placeholder: "Post your reply",
+               onDone: () => viewThread(id) }),
+    replies);
+  if (!d.replies || d.replies.length === 0) {
+    replies.append(empty("No replies yet", "Be the first to reply."));
+  } else {
+    replies.append(...d.replies.map(p => postCard(p, { onChange: () => viewThread(id) })));
+  }
+}
+
+async function editProfile() {
+  const dn = prompt("Display name (blank to clear):", me.display_name || "");
+  if (dn === null) return;
+  const bio = prompt("Bio (blank to clear):", me.bio || "");
+  if (bio === null) return;
+  try {
+    me = await api("/api/me", "PATCH", { display_name: dn, bio });
+    paintNav();
+    toast("Profile updated");
+    route();
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ------------------------------------------------------------------ *
+ * Router
+ * ------------------------------------------------------------------ */
+function route() {
+  const h = location.hash || "#/home";
+  const [, section, arg] = h.slice(1).split("/");
+
+  document.querySelectorAll("[data-nav]").forEach(a => {
+    const on = (a.dataset.nav === "home"    && section === "home")
+            || (a.dataset.nav === "explore" && section === "explore")
+            || (a.dataset.nav === "me"      && (section === "me" ||
+                 (section === "u" && arg === me?.username)));
+    a.classList.toggle("active", on);
+  });
+
+  const fail = e => view().replaceChildren(header("Something went wrong"), empty("Error", e.message));
+
+  if (section === "explore")   return viewExplore().catch(fail);
+  if (section === "u" && arg)  return viewProfile(arg).catch(fail);
+  if (section === "post" && arg) return viewThread(arg).catch(fail);
+  if (section === "me")        return viewProfile(me.username).catch(fail);
+  return viewHome().catch(fail);
+}
+window.addEventListener("hashchange", route);
+
+/* ------------------------------------------------------------------ *
+ * Auth
+ * ------------------------------------------------------------------ */
+let mode = "login";
+
+$("swapBtn").addEventListener("click", () => {
+  mode = mode === "login" ? "signup" : "login";
+  const signup = mode === "signup";
+  $("authLede").textContent = signup ? "Create an account to get started." : "Sign in to continue.";
+  $("authBtn").textContent  = signup ? "Sign up" : "Log in";
+  $("swapText").textContent = signup ? "Already have an account?" : "No account?";
+  $("swapBtn").textContent  = signup ? "Log in" : "Sign up";
+  $("p").setAttribute("autocomplete", signup ? "new-password" : "current-password");
+});
+
+$("authForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const btn = $("authBtn");
+  btn.disabled = true;
+  try {
+    await api("/api/" + mode, "POST", { username: $("u").value.trim(), password: $("p").value });
+    $("p").value = "";
+    await boot();
+  } catch (err) {
+    toast(err.message, true);
+  }
+  btn.disabled = false;
+});
+
+$("logout").addEventListener("click", async () => {
+  try { await api("/api/logout", "POST"); } catch {}
+  me = null;
+  $("app").classList.add("hidden");
+  $("auth").classList.remove("hidden");
+});
+
+function paintNav() {
+  $("navAv").replaceWith(Object.assign(avatar(me.username, "sm"), { id: "navAv" }));
+  $("navName").textContent = me.display_name || me.username;
+  $("navHandle").textContent = "@" + me.username;
+}
+
+async function boot() {
+  try {
+    me = await api("/api/me");
+  } catch {
+    $("app").classList.add("hidden");
+    $("auth").classList.remove("hidden");
+    return;
+  }
+  $("auth").classList.add("hidden");
+  $("app").classList.remove("hidden");
+  paintNav();
+  route();
+}
+boot();
+</script>
+</body>
+</html>

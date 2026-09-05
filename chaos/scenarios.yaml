@@ -1,0 +1,187 @@
+# Chaos scenarios for RCA practice.
+#
+# Each one is a realistic production failure, injected by a single command and
+# fully reversible. The `hint` and `root_cause` fields are what `reveal.sh`
+# prints — do not read this file before investigating, or you are just
+# rehearsing an answer you already have.
+#
+# Difficulty:
+#   1  symptom points almost directly at the cause
+#   2  needs one layer of indirection
+#   3  symptom actively misleads you toward the wrong component
+
+scenarios:
+
+  - id: oomkill
+    name: "Application pods keep restarting"
+    difficulty: 1
+    layer: kubernetes
+    inject: |
+      kubectl -n l2lab patch deployment app --type=json \
+        -p='[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/memory","value":"24Mi"}]'
+    restore: |
+      kubectl -n l2lab patch deployment app --type=json \
+        -p='[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/memory","value":"192Mi"}]'
+    symptom: "The site returns 502. Pods cycle between Running and CrashLoopBackOff."
+    hint: "What does `kubectl describe pod` say under Last State?"
+    root_cause: >-
+      The memory limit was lowered to 24Mi, below the Go runtime's working set.
+      The kernel OOMKills the container on startup. Exit code 137 = 128 + 9 (SIGKILL).
+      Memory is incompressible: unlike CPU it cannot be throttled, only killed.
+
+  - id: cpu-throttle
+    name: "Latency spiked but nothing looks broken"
+    difficulty: 3
+    layer: kubernetes
+    inject: |
+      kubectl -n l2lab patch deployment app --type=json \
+        -p='[{"op":"add","path":"/spec/template/spec/containers/0/resources/limits/cpu","value":"20m"}]'
+    restore: |
+      kubectl -n l2lab patch deployment app --type=json \
+        -p='[{"op":"remove","path":"/spec/template/spec/containers/0/resources/limits/cpu"}]'
+    symptom: "p99 latency is 10x normal. Postgres and Redis latency are flat. No errors, no restarts."
+    hint: "Dependencies are healthy, so the time is being spent inside the pod. Doing what — or waiting for what?"
+    root_cause: >-
+      A 20m CPU limit was added. The CFS scheduler throttles the container every
+      period once it exhausts its quota, so requests sit ready-to-run but unscheduled.
+      Look at container_cpu_cfs_throttled_seconds_total — it is on the dashboard.
+      This is the classic "the app is slow" that is actually "we capped the app".
+
+  - id: bad-probe
+    name: "Deploy went out, now everything 502s"
+    difficulty: 2
+    layer: kubernetes
+    inject: |
+      kubectl -n l2lab patch deployment app --type=json \
+        -p='[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/ready"}]'
+    restore: |
+      kubectl -n l2lab patch deployment app --type=json \
+        -p='[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/readyz"}]'
+    symptom: "ALB returns 502. Pods are Running but never become Ready. The application logs look completely normal."
+    hint: "Running and Ready are different things. Which one is failing, and what decides it?"
+    root_cause: >-
+      The readiness probe path was changed to /ready, which does not exist —
+      the endpoint is /readyz. The probe gets 404, the pod never goes Ready,
+      so it is never registered in the ALB target group, so the ALB has no
+      healthy target and returns 502. The app itself is perfectly healthy.
+
+  - id: alb-routing
+    name: "The site loads but nothing works"
+    difficulty: 3
+    layer: aws
+    inject: |
+      kubectl -n l2lab annotate ingress api \
+        alb.ingress.kubernetes.io/group.order=99 --overwrite
+    restore: |
+      kubectl -n l2lab annotate ingress api \
+        alb.ingress.kubernetes.io/group.order=10 --overwrite
+    symptom: "The page renders, but login fails and the timeline never loads. The browser console shows API calls returning HTML instead of JSON."
+    hint: "Two Ingresses share one ALB. What decides which rule an incoming request matches?"
+    root_cause: >-
+      The API Ingress group.order was raised to 99, above the frontend's 20.
+      The ALB evaluates listener rules in ascending priority and stops at the
+      first match. The frontend rule is /* which matches everything, so /api
+      requests are now answered with index.html. Ordering, not availability.
+
+  - id: irsa-broken
+    name: "DNS records stopped updating"
+    difficulty: 2
+    layer: aws
+    inject: |
+      kubectl -n kube-system annotate serviceaccount external-dns \
+        eks.amazonaws.com/role-arn=arn:aws:iam::134604498185:role/l2lab-sawibowo-external-dnss --overwrite
+      kubectl -n kube-system rollout restart deploy/external-dns
+    restore: |
+      kubectl -n kube-system annotate serviceaccount external-dns \
+        eks.amazonaws.com/role-arn=arn:aws:iam::134604498185:role/l2lab-sawibowo-external-dns --overwrite
+      kubectl -n kube-system rollout restart deploy/external-dns
+    symptom: "The existing site still works, but a new Ingress never gets a DNS record."
+    hint: "The pod is Running and has no crash. What is it actually failing to do, and against what?"
+    root_cause: >-
+      The IRSA role ARN on the ServiceAccount was changed to a role that does
+      not exist (trailing 's'). STS refuses AssumeRoleWithWebIdentity, so every
+      Route53 call fails with AccessDenied. The pod stays Running because it
+      retries forever — the failure is only visible in its logs.
+
+  - id: redis-evict
+    name: "Users are being randomly logged out"
+    difficulty: 2
+    layer: application
+    inject: |
+      kubectl -n l2lab exec redis-0 -- redis-cli CONFIG SET maxmemory 2mb
+    restore: |
+      kubectl -n l2lab exec redis-0 -- redis-cli CONFIG SET maxmemory 192mb
+    symptom: "Users report being logged out mid-session. No errors, no restarts, no deploys."
+    hint: "Where do sessions live, and what happens to that store when it fills up?"
+    root_cause: >-
+      Redis maxmemory was dropped to 2mb. Under the allkeys-lru policy, Redis
+      evicts the least recently used key of ANY kind when full — including
+      session keys, not just cache entries. Check `redis-cli info stats | grep
+      evicted`. The fix is either more memory or a policy that protects sessions.
+
+  - id: worker-lag
+    name: "Timelines are stale but the site is fine"
+    difficulty: 2
+    layer: application
+    inject: |
+      kubectl -n l2lab set env deployment/worker WORK_DELAY=15s
+    restore: |
+      kubectl -n l2lab set env deployment/worker WORK_DELAY-
+    symptom: "New posts do not appear in followers' timelines for minutes. Everything else is healthy."
+    hint: "This is degraded, not down. Which component sits between a post and a timeline update?"
+    root_cause: >-
+      The fan-out worker had an artificial 15s delay injected, so it processes
+      NATS messages far slower than they arrive. app_worker_lag_seconds climbs.
+      This is the single most useful distinction in L2 triage: the system is UP
+      and correct-eventually, just not correct-now.
+
+  - id: dns-down
+    name: "Everything broke at once"
+    difficulty: 2
+    layer: kubernetes
+    inject: |
+      kubectl -n kube-system scale deployment coredns --replicas=0
+    restore: |
+      kubectl -n kube-system scale deployment coredns --replicas=2
+    symptom: "Every pod starts failing. Postgres, Redis and NATS all 'unreachable' simultaneously. The pods themselves are Running."
+    hint: "Three unrelated dependencies failing at the same instant is not three failures."
+    root_cause: >-
+      CoreDNS was scaled to zero. Nothing can resolve
+      postgres.l2lab.svc.cluster.local, so every dependency appears down at
+      once. When several unrelated things fail simultaneously, suspect a shared
+      dependency — DNS, network, or auth — rather than a coincidence.
+
+  - id: image-pull
+    name: "The new deploy is stuck"
+    difficulty: 1
+    layer: kubernetes
+    inject: |
+      kubectl -n l2lab set image deployment/frontend nginx=$(kubectl -n l2lab get deploy frontend -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d: -f1):v0-does-not-exist
+    restore: "RESTORE_FROM_SNAPSHOT"
+    symptom: "A frontend deploy has been rolling for ten minutes. The old pod is still serving traffic."
+    hint: "What state is the NEW pod in, and what does its describe output say?"
+    root_cause: >-
+      The image tag does not exist in ECR. The new pod sits in
+      ImagePullBackOff. Note the site stayed UP the whole time — maxUnavailable:0
+      means the old pod is not removed until the new one is Ready, which is
+      exactly what that setting is for.
+
+  - id: db-connection-cap
+    name: "Database is slow under load"
+    difficulty: 3
+    layer: application
+    inject: |
+      kubectl -n l2lab exec postgres-0 -- psql -U l2lab -d l2lab -c "ALTER SYSTEM SET max_connections = 5;"
+      kubectl -n l2lab exec postgres-0 -- psql -U l2lab -d l2lab -c "SELECT pg_reload_conf();"
+      kubectl -n l2lab delete pod postgres-0
+    restore: |
+      kubectl -n l2lab exec postgres-0 -- psql -U l2lab -d l2lab -c "ALTER SYSTEM RESET max_connections;"
+      kubectl -n l2lab exec postgres-0 -- psql -U l2lab -d l2lab -c "SELECT pg_reload_conf();"
+      kubectl -n l2lab delete pod postgres-0
+    symptom: "Requests time out under load. Postgres CPU is near zero. The database 'is slow' but appears idle."
+    hint: "An idle database that cannot serve requests is not slow. What else sits between the app and the query?"
+    root_cause: >-
+      Postgres max_connections was set to 5. The application's pgx pool wants 10
+      per replica, so most connection attempts are refused and requests queue
+      waiting to acquire one. Latency is spent in connection acquisition, not in
+      query execution — which is why the database looks idle.

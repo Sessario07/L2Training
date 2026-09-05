@@ -1,0 +1,197 @@
+---
+# Collect everything you would want during an incident, in one pass, into a
+# timestamped directory.
+#
+#   ansible-playbook ops/diagnostics.yml
+#
+# Why this exists: during an incident you run fifteen kubectl commands, half of
+# them wrong, and by the time you have the picture the evidence has rotated
+# away. Pods restart, logs roll, events expire after an hour. This grabs a
+# consistent snapshot in about twenty seconds so you can investigate calmly and
+# still have evidence for the RCA afterwards.
+#
+# `kubectl logs --previous` is included deliberately: after a crash, the logs
+# that explain it belong to the container that DIED, not the one now starting.
+
+- name: Collect diagnostics
+  hosts: localhost
+  gather_facts: true
+
+  vars:
+    out: "{{ repo_root }}/diagnostics/{{ ansible_date_time.iso8601_basic_short }}"
+
+  tasks:
+    - name: Create the output directory
+      ansible.builtin.file:
+        path: "{{ out }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: ["cluster", "logs", "describe", "aws"]
+
+    # ------------------------------------------------------------- cluster
+    - name: Capture cluster-wide state
+      ansible.builtin.shell:
+        cmd: "{{ item.cmd }} > {{ out }}/cluster/{{ item.name }} 2>&1 || true"
+      changed_when: false
+      loop:
+        - { name: nodes.txt,        cmd: "kubectl get nodes -o wide" }
+        - { name: nodes-detail.txt, cmd: "kubectl describe nodes" }
+        - { name: pods.txt,         cmd: "kubectl get pods -A -o wide" }
+        # Sorted by time so the most recent events are at the bottom, which is
+        # what you actually want to read first.
+        - { name: events.txt,       cmd: "kubectl get events -A --sort-by=.lastTimestamp" }
+        - { name: ingress.txt,      cmd: "kubectl get ingress -A -o yaml" }
+        - { name: pvc.txt,          cmd: "kubectl get pvc,pv -A -o wide" }
+        - { name: svc-endpoints.txt, cmd: "kubectl get svc,endpoints -A" }
+        - { name: deployments.txt,  cmd: "kubectl get deploy,sts,ds -A -o wide" }
+        - { name: hpa.txt,          cmd: "kubectl get hpa -A" }
+        - { name: top-nodes.txt,    cmd: "kubectl top nodes" }
+        - { name: top-pods.txt,     cmd: "kubectl top pods -A --sort-by=memory" }
+        - { name: netpol.txt,       cmd: "kubectl get networkpolicy -A -o yaml" }
+        - { name: quota.txt,        cmd: "kubectl describe resourcequota -A" }
+        - { name: api-resources.txt, cmd: "kubectl api-resources --verbs=list -o name" }
+      loop_control: { label: "{{ item.name }}" }
+
+    - name: Capture anything not Running
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl get pods -A
+          --field-selector=status.phase!=Running,status.phase!=Succeeded -o yaml
+          > {{ out }}/cluster/not-running.yaml 2>&1 || true
+      changed_when: false
+
+    # ---------------------------------------------------------------- logs
+    - name: List pods to gather logs from
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ item }}"
+      register: pods
+      loop: ["{{ ns_app }}", "{{ ns_obs }}", "{{ ns_sys }}"]
+
+    - name: Capture current logs
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl logs -n {{ item.metadata.namespace }} {{ item.metadata.name }}
+          --all-containers --tail=500
+          > {{ out }}/logs/{{ item.metadata.namespace }}_{{ item.metadata.name }}.log 2>&1 || true
+      changed_when: false
+      loop: "{{ pods.results | map(attribute='resources') | flatten }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+
+    - name: Capture PREVIOUS logs for anything that has restarted
+      # This is the important one. If a container crashed, the explanation is
+      # in the log of the instance that died, not the one now running.
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl logs -n {{ item.metadata.namespace }} {{ item.metadata.name }}
+          --all-containers --previous --tail=500
+          > {{ out }}/logs/PREVIOUS_{{ item.metadata.namespace }}_{{ item.metadata.name }}.log 2>&1 || true
+      changed_when: false
+      when: >-
+        (item.status.containerStatuses | default([])
+         | map(attribute='restartCount') | sum) > 0
+      loop: "{{ pods.results | map(attribute='resources') | flatten }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+
+    - name: Describe every pod in our namespaces
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl describe pod -n {{ item.metadata.namespace }} {{ item.metadata.name }}
+          > {{ out }}/describe/{{ item.metadata.namespace }}_{{ item.metadata.name }}.txt 2>&1 || true
+      changed_when: false
+      loop: >-
+        {{ pods.results[:2] | map(attribute='resources') | flatten }}
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+
+    # ----------------------------------------------------------------- aws
+    - name: Capture AWS-side state
+      ansible.builtin.shell:
+        cmd: "{{ item.cmd }} > {{ out }}/aws/{{ item.name }} 2>&1 || true"
+      changed_when: false
+      loop:
+        - name: nodegroup.json
+          cmd: >-
+            aws eks describe-nodegroup --region {{ aws_region }}
+            --cluster-name {{ project }} --nodegroup-name {{ nodegroup }}
+        - name: addons.json
+          cmd: >-
+            aws eks list-addons --region {{ aws_region }} --cluster-name {{ project }}
+        - name: load-balancers.json
+          cmd: >-
+            aws elbv2 describe-load-balancers --region {{ aws_region }}
+        - name: target-health.txt
+          cmd: >-
+            bash -c 'for tg in $(aws elbv2 describe-target-groups --region {{ aws_region }}
+            --query "TargetGroups[?contains(TargetGroupName,\`{{ project | truncate(20, true, "") }}\`)].TargetGroupArn"
+            --output text); do echo "== $tg"; aws elbv2 describe-target-health
+            --region {{ aws_region }} --target-group-arn $tg; done'
+        - name: route53.json
+          cmd: >-
+            aws route53 list-resource-record-sets
+            --hosted-zone-id Z0646008ZGZY2INOOAOG
+            --query "ResourceRecordSets[?contains(Name, '{{ domain.split('.')[0] }}')]"
+        - name: spot-interruptions.json
+          cmd: >-
+            aws ec2 describe-instances --region {{ aws_region }}
+            --filters "Name=tag:eks:nodegroup-name,Values={{ nodegroup }}"
+            --query "Reservations[].Instances[].{id:InstanceId,state:State.Name,type:InstanceType,az:Placement.AvailabilityZone,lifecycle:InstanceLifecycle}"
+      loop_control: { label: "{{ item.name }}" }
+
+    # -------------------------------------------------------------- metrics
+    - name: Snapshot key Prometheus queries
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl exec -n {{ ns_obs }} prometheus-0 --
+          wget -qO- --timeout=10
+          "http://localhost:9090/api/v1/query?query={{ item.q | urlencode }}"
+          > {{ out }}/cluster/metric_{{ item.name }}.json 2>&1 || true
+      changed_when: false
+      loop:
+        - { name: error_ratio,   q: 'app:http_error_ratio5m' }
+        - { name: p99,           q: 'app:http_p99_latency5m' }
+        - { name: restarts,      q: 'kube_pod_container_status_restarts_total' }
+        - { name: throttling,    q: 'rate(container_cpu_cfs_throttled_seconds_total[5m])' }
+        - { name: firing_alerts, q: 'ALERTS{alertstate="firing"}' }
+      loop_control: { label: "{{ item.name }}" }
+
+    - name: Write a summary index
+      ansible.builtin.copy:
+        dest: "{{ out }}/README.md"
+        mode: "0644"
+        content: |
+          # Diagnostics snapshot
+
+          Collected: {{ ansible_date_time.iso8601 }}
+          Cluster:   {{ project }} ({{ aws_region }})
+
+          ## Read these first, in this order
+
+          1. `cluster/events.txt`      — what changed recently (newest last)
+          2. `cluster/not-running.yaml` — anything unhealthy right now
+          3. `logs/PREVIOUS_*`         — logs from containers that DIED
+          4. `cluster/top-pods.txt`    — memory pressure
+          5. `aws/target-health.txt`   — is the ALB seeing healthy targets?
+          6. `cluster/metric_firing_alerts.json` — what Prometheus thinks
+
+          ## Contents
+
+          | Directory | What is in it |
+          |---|---|
+          | `cluster/` | Cluster-wide state, events, resource usage, metrics |
+          | `logs/`    | Last 500 lines per pod; `PREVIOUS_` = the crashed instance |
+          | `describe/`| Full describe output for app and observability pods |
+          | `aws/`     | Node group, addons, load balancers, target health, DNS |
+
+          ## For the RCA
+
+          Use `docs/rca/TEMPLATE.md`. Attach the specific files that support
+          your timeline rather than the whole directory.
+
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "Diagnostics written to: {{ out }}"
+          - "Start with {{ out }}/README.md"

@@ -1,0 +1,24 @@
+# Two namespaces, so RBAC, NetworkPolicy and resource quotas can treat the
+# application and the monitoring stack differently.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: l2lab
+  labels:
+    name: l2lab
+    # Enforces the "restricted" Pod Security Standard: no privileged
+    # containers, no host namespaces, must run as non-root. This is what
+    # production clusters do, and it will reject a badly-written pod spec.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    name: observability
+    # Only "baseline", not "restricted": the Alloy log collector needs to read
+    # /var/log/pods from the host, which "restricted" forbids.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest

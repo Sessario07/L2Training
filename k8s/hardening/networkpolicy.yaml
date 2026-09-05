@@ -1,0 +1,305 @@
+# ---------------------------------------------------------------------------
+# NetworkPolicy — default deny, then allow exactly what is needed.
+#
+# APPLIED SEPARATELY, on purpose (`make harden`). Get a NetworkPolicy slightly
+# wrong and the symptoms are indistinguishable from DNS failure, a dead
+# dependency, or an application bug. Stand the cluster up green first, then
+# add segmentation, so you know which change caused what.
+#
+# These are only ENFORCED because terraform/addons.tf sets
+# enableNetworkPolicy=true on the VPC CNI. Without that the API server accepts
+# every policy below and silently enforces none of them — which is far worse
+# than having no policies, because you believe you are segmented.
+#
+# Debugging:
+#   kubectl exec -n l2lab deploy/app -- nc -zv postgres 5432
+#   kubectl logs -n kube-system -l k8s-app=aws-node -c aws-eks-nodeagent
+# ---------------------------------------------------------------------------
+
+# --- l2lab: deny everything not explicitly allowed below --------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: l2lab
+spec:
+  # An empty podSelector selects EVERY pod in the namespace.
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  # No ingress/egress rules at all == deny both directions.
+---
+# --- Everything needs DNS ---------------------------------------------------
+# The most common NetworkPolicy mistake by a wide margin: denying egress
+# without allowing DNS. Every hostname lookup then fails, and the resulting
+# errors point at the wrong component entirely.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: l2lab
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }   # TCP too — large responses fall back to it
+---
+# --- app: inbound from the ALB and from Prometheus --------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: app-ingress
+  namespace: l2lab
+spec:
+  podSelector:
+    matchLabels: { app: app }
+  policyTypes: [Ingress]
+  ingress:
+    # The ALB uses target-type: ip, so traffic arrives from the load balancer's
+    # ENIs inside the VPC — not from a pod. It must be allowed by CIDR.
+    - from:
+        - ipBlock: { cidr: 10.42.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 8080 }
+    # Prometheus scraping /metrics from the observability namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels: { name: observability }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+# --- frontend: inbound from the ALB only ------------------------------------
+# It serves static files. It talks to nothing, so it gets no egress rule
+# beyond the shared DNS allowance.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-ingress
+  namespace: l2lab
+spec:
+  podSelector:
+    matchLabels: { app: frontend }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: { cidr: 10.42.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+# --- worker: only Prometheus talks to it ------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-ingress
+  namespace: l2lab
+spec:
+  podSelector:
+    matchLabels: { app: worker }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { name: observability }
+      ports:
+        - { protocol: TCP, port: 8081 }
+---
+# --- app + worker egress ----------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: app-egress
+  namespace: l2lab
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [app, worker] }
+  policyTypes: [Egress]
+  egress:
+    # The three backing services, by port.
+    - to:
+        - podSelector:
+            matchLabels: { app: postgres }
+      ports: [{ protocol: TCP, port: 5432 }]
+    - to:
+        - podSelector:
+            matchLabels: { app: redis }
+      ports: [{ protocol: TCP, port: 6379 }]
+    - to:
+        - podSelector:
+            matchLabels: { app: nats }
+      ports: [{ protocol: TCP, port: 4222 }]
+    # OTLP traces to Tempo, across namespaces.
+    - to:
+        - namespaceSelector:
+            matchLabels: { name: observability }
+          podSelector:
+            matchLabels: { app: tempo }
+      ports: [{ protocol: TCP, port: 4318 }]
+    # AWS APIs (STS for IRSA, Secrets Manager). These leave the VPC via the
+    # NAT Gateway, so the destination cannot be expressed as a pod selector.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.42.0.0/16]
+      ports: [{ protocol: TCP, port: 443 }]
+---
+# --- postgres: only the app, worker and backup job may connect --------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: l2lab
+spec:
+  podSelector:
+    matchLabels: { app: postgres }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: app, operator: In, values: [app, worker, backup, postgres-monitoring-role] }
+      ports: [{ protocol: TCP, port: 5432 }]
+    # Prometheus scraping the postgres-exporter sidecar.
+    - from:
+        - namespaceSelector:
+            matchLabels: { name: observability }
+      ports: [{ protocol: TCP, port: 9187 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+  namespace: l2lab
+spec:
+  podSelector:
+    matchLabels: { app: redis }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: app, operator: In, values: [app, worker] }
+      ports: [{ protocol: TCP, port: 6379 }]
+    # Prometheus scraping the redis_exporter sidecar.
+    - from:
+        - namespaceSelector:
+            matchLabels: { name: observability }
+      ports: [{ protocol: TCP, port: 9121 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nats-ingress
+  namespace: l2lab
+spec:
+  podSelector:
+    matchLabels: { app: nats }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: app, operator: In, values: [app, worker] }
+      ports: [{ protocol: TCP, port: 4222 }]
+    - from:
+        - namespaceSelector:
+            matchLabels: { name: observability }
+      ports: [{ protocol: TCP, port: 8222 }]
+    # The NATS exporter Deployment polls the monitoring endpoint.
+    - from:
+        - podSelector:
+            matchLabels: { app: nats-exporter }
+      ports: [{ protocol: TCP, port: 8222 }]
+---
+# --- nats-exporter: scraped by Prometheus, polls NATS -----------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nats-exporter
+  namespace: l2lab
+spec:
+  podSelector:
+    matchLabels: { app: nats-exporter }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { name: observability }
+      ports: [{ protocol: TCP, port: 7777 }]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app: nats }
+      ports: [{ protocol: TCP, port: 8222 }]
+---
+# --- the monitoring-role Job needs Postgres and AWS -------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: monitoring-role-job-egress
+  namespace: l2lab
+spec:
+  podSelector:
+    matchLabels: { app: postgres-monitoring-role }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app: postgres }
+      ports: [{ protocol: TCP, port: 5432 }]
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.42.0.0/16]
+      ports: [{ protocol: TCP, port: 443 }]
+---
+# --- backup CronJob egress: Postgres, plus S3 and Secrets Manager -----------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backup-egress
+  namespace: l2lab
+spec:
+  podSelector:
+    matchLabels: { app: backup }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app: postgres }
+      ports: [{ protocol: TCP, port: 5432 }]
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.42.0.0/16]
+      ports: [{ protocol: TCP, port: 443 }]
+---
+# --- observability: allow all internally, restrict inbound ------------------
+# The monitoring stack is left deliberately permissive between its own
+# components. Segmenting Prometheus from Loki buys little and breaks a lot.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: observability
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    # Anything else in this namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels: { name: observability }
+    # The application, sending OTLP traces.
+    - from:
+        - namespaceSelector:
+            matchLabels: { name: l2lab }
+    # The ALB reaching Grafana.
+    - from:
+        - ipBlock: { cidr: 10.42.0.0/16 }

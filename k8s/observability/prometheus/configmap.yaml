@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: l2lab-sawibowo
+
+    rule_files:
+      - /etc/prometheus/rules/*.yaml
+
+    # Where firing alerts are sent. Discovered by DNS rather than hard-coded
+    # to an IP, so an Alertmanager restart does not need a Prometheus reload.
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ["alertmanager.observability.svc.cluster.local:9093"]
+
+    scrape_configs:
+
+      # --- Prometheus itself ---------------------------------------------
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # --- Any pod annotated with prometheus.io/scrape: "true" -----------
+      # This is how the application pods get discovered. The annotation-based
+      # pattern means a new service becomes monitored just by adding three
+      # annotations - no Prometheus config change, no restart.
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Only scrape pods that opt in.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # Let the pod override the metrics path.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          # ...and the port. This rewrites the address to <pod-ip>:<port>.
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          # Copy useful Kubernetes metadata onto every metric, so you can
+          # filter by namespace/pod/node in Grafana.
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          # Drop pods that are not running, to avoid noisy scrape failures.
+          - source_labels: [__meta_kubernetes_pod_phase]
+            action: drop
+            regex: (Pending|Succeeded|Failed|Unknown)
+
+      # --- kube-state-metrics (EKS managed addon) -------------------------
+      # Object-level state: how many replicas a Deployment wants versus has,
+      # which pods are Pending, container restart counts.
+      - job_name: kube-state-metrics
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names: [kube-system]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: kube-state-metrics
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: "http|http-metrics|metrics|8080"
+
+      # --- node-exporter (EKS managed addon) ------------------------------
+      # Host-level: CPU, memory, disk, network, filesystem fullness.
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names: [kube-system]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: .*node-exporter.*
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+
+      # --- kubelet ---------------------------------------------------------
+      # Scraped through the API server proxy, which avoids needing to trust
+      # each kubelet's self-signed serving certificate.
+      - job_name: kubelet
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics
+
+      # --- cAdvisor (per-container CPU/memory, inside the kubelet) --------
+      # This is where container_cpu_cfs_throttled_seconds_total lives - the
+      # metric that proves a CPU limit is throttling your app.
+      - job_name: cadvisor
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor

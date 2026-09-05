@@ -1,0 +1,188 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+  namespace: l2lab
+  labels: { app: app }
+spec:
+  selector: { app: app }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: l2lab
+  labels: { app: app }
+spec:
+  # Start at 1; the HPA scales to 2 under load. Note the HPA owns this field
+  # once it exists, so changing it here after the fact has no lasting effect.
+  replicas: 1
+  selector:
+    matchLabels: { app: app }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0    # never drop below the desired count during a deploy
+  template:
+    metadata:
+      labels: { app: app }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      # Must exceed the app's own PRESTOP_DELAY (5s) plus its 20s shutdown
+      # budget, or Kubernetes SIGKILLs mid-drain and clients see resets.
+      serviceAccountName: app
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      # Spread replicas across nodes and AZs. With 2 replicas on 2 nodes this
+      # means losing one spot instance costs you half the capacity, not all
+      # of it. ScheduleAnyway rather than DoNotSchedule so a single-node
+      # cluster still schedules both.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: app }
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: app }
+      containers:
+        - name: api
+          image: l2lab-app:latest    # replaced by `kustomize edit set image`
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef: { name: app-config }
+          env:
+            # Read from the CSI-mounted file rather than an env var. See
+            # app/internal/obs/env.go for why: it avoids the ordering problem
+            # with secretKeyRef, and keeps the DSN out of process environments
+            # and crash dumps.
+            - name: DATABASE_URL_FILE
+              value: /mnt/secrets/postgres-url
+            # Surfaced as OpenTelemetry resource attributes, so a trace tells
+            # you which pod and node served it.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+          volumeMounts:
+            - name: secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            # Memory limit only. A CPU limit here would throttle bcrypt during
+            # login bursts and look like a mysterious latency problem.
+            limits: { memory: 192Mi }
+
+          # LIVENESS: shallow on purpose. Only restarts a genuinely wedged
+          # process. If this checked Postgres, a database blip would restart
+          # every pod and turn a recoverable outage into a crash loop.
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # READINESS: deep. Checks Postgres and Redis. Failing pulls the pod
+          # out of the ALB target group WITHOUT restarting it, so it can
+          # recover on its own once the dependency comes back.
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # STARTUP: covers the migration run on first boot. Until this
+          # succeeds the liveness probe is suspended, so slow startup cannot
+          # cause a restart loop.
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 3
+            failureThreshold: 30
+
+          # NOTE: there is no preStop exec hook. The image is built FROM
+          # scratch, so there is no shell to run `sleep` in. The delay is
+          # implemented inside the Go binary instead (PRESTOP_DELAY), which
+          # is more reliable anyway.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: postgres
+---
+# A PodDisruptionBudget protects against VOLUNTARY disruption only: node
+# drains, cluster upgrades, `kubectl drain`. It does NOT protect against a
+# spot reclaim or a node crash.
+#
+# maxUnavailable, NOT minAvailable. This matters now that the floor is 1
+# replica: `minAvailable: 1` with a single running pod means the pod can never
+# be evicted, so `kubectl drain` hangs forever waiting for a disruption that is
+# not allowed. That is a classic self-inflicted incident, and switching the
+# floor from 2 to 1 is exactly when people walk into it.
+#
+# maxUnavailable: 1 always permits one pod down, so a drain can proceed. At 2
+# replicas it still guarantees one stays up during the drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: app
+  namespace: l2lab
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: app }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: app
+  namespace: l2lab
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: app
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+    # Scales on CPU as a percentage of the REQUEST (50m), not the limit.
+    # 70% of 50m is 35m - deliberately low so `make load` can actually
+    # trigger a scale-up, rather than the HPA sitting at 1 replica forever.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      # Long window to prevent flapping: scale down only after 5 quiet minutes.
+      stabilizationWindowSeconds: 300

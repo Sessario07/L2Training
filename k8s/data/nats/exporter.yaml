@@ -1,0 +1,64 @@
+# NATS metrics exporter.
+#
+# A separate Deployment rather than a sidecar, unlike the Postgres and Redis
+# exporters. Two reasons:
+#
+#   1. This image runs as ROOT by default, which the `restricted` Pod Security
+#      Standard on this namespace forbids. Overriding runAsUser on a sidecar
+#      that fails to start would take the NATS pod down with it.
+#   2. NATS exposes its monitoring endpoint over the network on :8222, so
+#      there is no need to share a network namespace.
+#
+# Isolating a component you are less sure about is the right instinct: a
+# metrics exporter must never be able to break the thing it observes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-exporter
+  namespace: l2lab
+  labels: { app: nats-exporter }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: nats-exporter }
+  template:
+    metadata:
+      labels: { app: nats-exporter }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7777"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        # The image declares no USER, so it would run as root. Pin it.
+        runAsUser: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: exporter
+          image: natsio/prometheus-nats-exporter:0.17.3
+          args:
+            # Which NATS monitoring endpoints to translate into Prometheus.
+            - -varz      # server: memory, cpu, connections, messages, bytes, slow consumers
+            - -connz     # per-connection: pending bytes, subscriptions
+            - -subz      # subscription counts (flag is -subz, not -subsz)
+            - -routez    # cluster routes (trivial here, single node)
+            - -healthz
+            - -port=7777
+            - http://nats.l2lab.svc.cluster.local:8222
+          ports:
+            - name: metrics
+              containerPort: 7777
+          resources:
+            requests: { cpu: 10m, memory: 24Mi }
+            limits: { memory: 64Mi }
+          readinessProbe:
+            httpGet: { path: /metrics, port: 7777 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

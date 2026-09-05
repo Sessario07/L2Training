@@ -1,0 +1,103 @@
+# Creates the read-only monitoring role and the pg_stat_statements extension.
+#
+# Why a Job and not a migration or an initdb script:
+#   - docker-entrypoint-initdb.d only runs when the data directory is EMPTY.
+#     This database is already initialised, so it will never run again.
+#   - The app's .sql migrations are static files and cannot interpolate the
+#     generated password from Secrets Manager.
+#
+# Fully idempotent, so re-running on every deploy is safe.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-monitoring-role
+  namespace: l2lab
+  annotations:
+    # Let `kubectl apply` replace the Job on a re-deploy. Job specs are
+    # immutable, so without this a second apply fails with a field-conflict
+    # error that looks alarming and means nothing.
+    kubectl.kubernetes.io/last-applied-configuration: ""
+spec:
+  backoffLimit: 6
+  # Clean itself up an hour after finishing rather than leaving a completed
+  # Job lying around in `kubectl get all` forever.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: { app: postgres-monitoring-role }
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: postgres
+      securityContext:
+        runAsUser: 70
+        runAsGroup: 70
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: setup
+          image: postgres:17-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              export PGPASSWORD="$(cat /mnt/secrets/postgres-password)"
+              MONITOR_PW="$(cat /mnt/secrets/postgres-monitor-password)"
+              HOST=postgres.l2lab.svc.cluster.local
+
+              echo "waiting for postgres..."
+              until pg_isready -h "$HOST" -U l2lab -d l2lab >/dev/null 2>&1; do sleep 2; done
+
+              echo "creating pg_stat_statements extension"
+              psql -h "$HOST" -U l2lab -d l2lab -v ON_ERROR_STOP=1 \
+                -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+
+              echo "creating/updating the l2lab_monitor role"
+              # CREATE ROLE has no IF NOT EXISTS, hence the DO block. The
+              # password is set every run so it always matches Secrets Manager
+              # even after a rotation.
+              psql -h "$HOST" -U l2lab -d l2lab -v ON_ERROR_STOP=1 <<SQL
+              DO \$\$
+              BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'l2lab_monitor') THEN
+                  CREATE ROLE l2lab_monitor LOGIN;
+                END IF;
+              END
+              \$\$;
+              ALTER ROLE l2lab_monitor WITH PASSWORD '${MONITOR_PW}';
+
+              -- pg_monitor is a predefined role that bundles read access to
+              -- the statistics views (pg_read_all_stats, pg_read_all_settings,
+              -- pg_stat_scan_tables). It grants NO access to table data.
+              GRANT pg_monitor TO l2lab_monitor;
+              GRANT CONNECT ON DATABASE l2lab TO l2lab_monitor;
+              GRANT USAGE ON SCHEMA public TO l2lab_monitor;
+              SQL
+
+              echo "verifying the monitoring role can read stats but NOT data"
+              PGPASSWORD="${MONITOR_PW}" psql -h "$HOST" -U l2lab_monitor -d l2lab -tAc \
+                "SELECT 'stats ok: '||count(*) FROM pg_stat_database;"
+              if PGPASSWORD="${MONITOR_PW}" psql -h "$HOST" -U l2lab_monitor -d l2lab \
+                   -tAc "SELECT count(*) FROM users;" >/dev/null 2>&1; then
+                echo "WARNING: monitor role can read table data - privileges are too broad"
+              else
+                echo "confirmed: monitor role cannot SELECT from users (least privilege holds)"
+              fi
+              echo "done"
+          volumeMounts:
+            - name: secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+          resources:
+            requests: { cpu: 25m, memory: 48Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: postgres

@@ -1,0 +1,41 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Vendored upstream manifests + policies (fetched by `make vendor`)
+terraform/policies/aws-lbc-iam-policy.json
+k8s/platform/aws-lbc/upstream.yaml
+
+# Local build output
+app/api
+app/worker
+
+# Incident evidence snapshots (make diagnose)
+diagnostics/
+
+# Playwright scratch output
+.playwright-mcp/
+
+# Ansible
+ansible/*.retry
+ansible/tfplan
+terraform/tfplan
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Stray screenshots
+*.png
+!docs/**/*.png
+
+# Chaos state (contains the answer while a fault is active)
+chaos/.active
+chaos/history.log
+chaos/.manual-active
+chaos/.manual-pod.yaml

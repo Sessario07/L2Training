@@ -1,0 +1,117 @@
+# TWO Ingresses on the SAME hostname, sharing ONE ALB, split by path:
+#
+#     https://app.sawibowo.sandbox.devopsinstitute.id/api/*  ->  app (Go API)
+#     https://app.sawibowo.sandbox.devopsinstitute.id/*      ->  frontend (nginx)
+#
+# Because both are the same origin, the browser's fetch('/api/timeline') needs
+# no CORS configuration and no proxy hop.
+#
+# `group.order` IS THE ROUTING PRIORITY and it matters enormously here. The ALB
+# evaluates listener rules in ascending order and stops at the first match. The
+# frontend rule is `/*`, which matches everything including /api. If the
+# frontend's order were lower than the API's, every API call would be answered
+# with index.html and the site would break in a way that looks like a frontend
+# bug rather than a routing one.
+#
+#     10  /api/*   -> app        (specific, must be evaluated first)
+#     20  /*       -> frontend   (catch-all, last)
+#     30  grafana  -> different hostname entirely
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: l2lab
+  annotations:
+    # internet-facing puts the ALB in the PUBLIC subnets. Those subnets are
+    # found by tag: kubernetes.io/role/elb=1 (set in terraform/vpc.tf).
+    # Missing that tag is the single most common reason an ALB never appears.
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    # target-type: ip registers POD IPs directly in the target group, so
+    # traffic goes ALB -> pod, skipping the kube-proxy hop.
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # Same group.name as the frontend and Grafana, so all three share ONE ALB
+    # and we pay for one load balancer instead of three.
+    alb.ingress.kubernetes.io/group.name: l2lab
+    alb.ingress.kubernetes.io/group.order: "10"
+
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # No certificate-arn on purpose: the controller discovers the matching ACM
+    # certificate by comparing the `host` rules below against the certificates
+    # in this account and region.
+
+    # The ALB's own health check, SEPARATE from the kubelet's readiness probe.
+    # A target can be Ready to Kubernetes and unhealthy to the ALB (or the
+    # reverse) - knowing which is failing is half of diagnosing a 502.
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # Must be shorter than the pod's terminationGracePeriodSeconds (40s).
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+
+    # ExternalDNS reads this and creates the Route53 alias record. Only ONE of
+    # the two Ingresses on this hostname needs it - both would fight over the
+    # same record.
+    external-dns.alpha.kubernetes.io/hostname: app.sawibowo.sandbox.devopsinstitute.id
+
+    alb.ingress.kubernetes.io/tags: Name=l2lab-sawibowo-alb,Project=l2lab-sawibowo,Owner=sawibowo,ManagedBy=kubernetes
+spec:
+  ingressClassName: alb
+  rules:
+    - host: app.sawibowo.sandbox.devopsinstitute.id
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: app
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+  namespace: l2lab
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/group.name: l2lab
+    # Higher than the API's 10, so `/api` is matched first. Swap these two
+    # numbers and the whole site breaks in a very instructive way.
+    alb.ingress.kubernetes.io/group.order: "20"
+
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # nginx serves this from its own config, not from a file on disk.
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=15
+
+    alb.ingress.kubernetes.io/tags: Name=l2lab-sawibowo-alb,Project=l2lab-sawibowo,Owner=sawibowo,ManagedBy=kubernetes
+spec:
+  ingressClassName: alb
+  rules:
+    - host: app.sawibowo.sandbox.devopsinstitute.id
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
